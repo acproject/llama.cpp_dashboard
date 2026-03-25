@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { ServiceMetrics, HealthCheckResult, LlamaService } from '@/types'
 import { getJson, setJson, lrange, lpush, ltrim, KEYS } from '@/lib/minimemory'
 import { checkAllServices } from '@/lib/health-check'
-import { smembers } from '@/lib/minimemory'
+import { keys } from '@/lib/minimemory'
 
 // GET /api/monitor - Get monitoring data for all services
 export async function GET(request: NextRequest) {
@@ -23,8 +23,8 @@ export async function GET(request: NextRequest) {
       })
     }
     
-    // Get data for all services
-    const serviceIds = await smembers(KEYS.SERVICES)
+    const serviceKeys = await keys('llama:service:*')
+    const serviceIds = serviceKeys.map(k => k.slice('llama:service:'.length))
     const services: LlamaService[] = []
     const metricsMap: Record<string, ServiceMetrics> = {}
     const healthMap: Record<string, HealthCheckResult> = {}
@@ -71,7 +71,8 @@ export async function GET(request: NextRequest) {
 // POST /api/monitor - Trigger health check
 export async function POST(request: NextRequest) {
   try {
-    const serviceIds = await smembers(KEYS.SERVICES)
+    const serviceKeys = await keys('llama:service:*')
+    const serviceIds = serviceKeys.map(k => k.slice('llama:service:'.length))
     const services: LlamaService[] = []
     
     for (const id of serviceIds) {
@@ -81,7 +82,6 @@ export async function POST(request: NextRequest) {
     
     const healthResults = await checkAllServices(services)
     
-    // Update service status based on health check
     for (const result of healthResults) {
       const service = services.find(s => s.id === result.serviceId)
       if (service) {

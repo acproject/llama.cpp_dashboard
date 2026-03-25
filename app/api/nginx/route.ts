@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { NginxConfig } from '@/types'
 import { getNginxConfig, setNginxConfig, generateNginxConfig, syncServicesToNginx, validateNginxConfig } from '@/lib/nginx-manager'
-import { getJson, smembers, KEYS } from '@/lib/minimemory'
+import { getJson, keys, KEYS } from '@/lib/minimemory'
 import { LlamaService } from '@/types'
 
 // GET /api/nginx - Get Nginx configuration
@@ -60,7 +60,8 @@ export async function POST(request: NextRequest) {
     
     if (body.action === 'sync') {
       // Sync all registered services to Nginx upstream
-      const serviceIds = await smembers(KEYS.SERVICES)
+      const serviceKeys = await keys('llama:service:*')
+      const serviceIds = serviceKeys.map(k => k.slice('llama:service:'.length))
       const services: LlamaService[] = []
       
       for (const id of serviceIds) {

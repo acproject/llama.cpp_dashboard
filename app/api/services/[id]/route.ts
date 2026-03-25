@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { LlamaService } from '@/types'
-import { getJson, setJson, deleteKey, srem, KEYS } from '@/lib/minimemory'
+import { getJson, setJson, deleteKey, KEYS } from '@/lib/minimemory'
 import { checkLlamaServer } from '@/lib/health-check'
 
 // GET /api/services/[id] - Get a specific service
@@ -89,9 +89,6 @@ export async function DELETE(
     await deleteKey(KEYS.SERVICE(id))
     await deleteKey(KEYS.METRICS(id))
     await deleteKey(KEYS.HEALTH(id))
-    
-    // Remove from services set
-    await srem(KEYS.SERVICES, id)
     
     return NextResponse.json({
       success: true,

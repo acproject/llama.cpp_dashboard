@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { DispatchConfig, LlamaService, DispatchRequest } from '@/types'
-import { getJson, setJson, smembers, KEYS } from '@/lib/minimemory'
+import { getJson, setJson, keys, KEYS } from '@/lib/minimemory'
 import { 
   getDispatchConfig, 
   setDispatchConfig, 
@@ -14,8 +14,8 @@ export async function GET() {
   try {
     const config = await getDispatchConfig()
     
-    // Get services and calculate distribution
-    const serviceIds = await smembers(KEYS.SERVICES)
+    const serviceKeys = await keys('llama:service:*')
+    const serviceIds = serviceKeys.map(k => k.slice('llama:service:'.length))
     const services: LlamaService[] = []
     
     for (const id of serviceIds) {
@@ -64,8 +64,8 @@ export async function POST(request: NextRequest) {
   try {
     const body: DispatchRequest = await request.json()
     
-    // Get all services
-    const serviceIds = await smembers(KEYS.SERVICES)
+    const serviceKeys = await keys('llama:service:*')
+    const serviceIds = serviceKeys.map(k => k.slice('llama:service:'.length))
     const services: LlamaService[] = []
     
     for (const id of serviceIds) {

@@ -5,9 +5,6 @@ import {
   setJson, 
   deleteKey, 
   keys, 
-  sadd, 
-  srem, 
-  smembers,
   KEYS 
 } from '@/lib/minimemory'
 import { generateId } from '@/lib/utils'
@@ -15,8 +12,8 @@ import { generateId } from '@/lib/utils'
 // GET /api/services - List all services
 export async function GET() {
   try {
-    // Get all service IDs from the set
-    const serviceIds = await smembers(KEYS.SERVICES)
+    const serviceKeys = await keys('llama:service:*')
+    const serviceIds = serviceKeys.map(k => k.slice('llama:service:'.length))
     const services: LlamaService[] = []
     
     for (const id of serviceIds) {
@@ -63,9 +60,6 @@ export async function POST(request: NextRequest) {
     
     // Save service
     await setJson(KEYS.SERVICE(id), service)
-    
-    // Add to services set
-    await sadd(KEYS.SERVICES, id)
     
     return NextResponse.json({
       success: true,

@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server'
 import { ping, testConnection } from '@/lib/minimemory'
-import { smembers, getJson, KEYS } from '@/lib/minimemory'
+import { keys, getJson, KEYS } from '@/lib/minimemory'
 import { LlamaService } from '@/types'
 
 // GET /api/status - Get overall system status
@@ -9,8 +9,8 @@ export async function GET() {
     // Test MiniMemory connection
     const connectionTest = await testConnection()
     
-    // Get services count
-    const serviceIds = await smembers(KEYS.SERVICES)
+    const serviceKeys = await keys('llama:service:*')
+    const serviceIds = serviceKeys.map(k => k.slice('llama:service:'.length))
     const services: LlamaService[] = []
     
     for (const id of serviceIds) {
