@@ -1,0 +1,21 @@
+{
+  "name": "minimemory",
+  "version": "0.1.0",
+  "description": "MiniMemory Node.js client (TCP + RESP)",
+  "license": "MIT",
+  "type": "commonjs",
+  "main": "./index.js",
+  "types": "./index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "require": "./index.js"
+    }
+  },
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "minimemory.node.js"
+  ]
+}
+
