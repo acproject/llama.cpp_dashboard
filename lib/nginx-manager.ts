@@ -37,6 +37,7 @@ export async function setNginxConfig(config: Partial<NginxConfig>): Promise<Ngin
  */
 export function generateNginxConfig(config: NginxConfig): string {
   const lines: string[] = []
+  const dashboardProxyBase = process.env.DASHBOARD_PROXY_BASE || 'http://127.0.0.1:3000'
   
   // Worker processes
   lines.push('worker_processes auto;')
@@ -133,6 +134,20 @@ export function generateNginxConfig(config: NginxConfig): string {
   // Default location - route to first upstream or llama_backend
   const defaultUpstream = config.upstreams[0]?.name || 'llama_backend'
   lines.push('        rewrite ^/v1/v1/(.*)$ /v1/$1 break;')
+  lines.push('        location = /v1/models {')
+  lines.push(`            proxy_pass ${dashboardProxyBase}/api/openai/models;`)
+  lines.push('            proxy_http_version 1.1;')
+  lines.push('            proxy_set_header Host $host;')
+  lines.push('            proxy_set_header X-Real-IP $remote_addr;')
+  lines.push('            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;')
+  lines.push('            proxy_set_header X-Forwarded-Proto $scheme;')
+  lines.push('            set $auth_header $http_authorization;')
+  lines.push('            if ($auth_header = "") {')
+  lines.push('                set $auth_header "Bearer $http_api_key";')
+  lines.push('            }')
+  lines.push('            proxy_set_header Authorization $auth_header;')
+  lines.push('            proxy_set_header api-key $http_api_key;')
+  lines.push('        }')
   lines.push('        location / {')
   lines.push(`            proxy_pass http://${defaultUpstream};`)
   lines.push('            proxy_http_version 1.1;')
