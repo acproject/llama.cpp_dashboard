@@ -25,19 +25,13 @@ function getSessionKey(request: NextRequest, parsedJson: any): string | null {
   const sessionId = parsedJson?.session_id
   if (typeof sessionId === 'string' && sessionId.trim()) return sessionId.trim()
 
-  const headerSession = request.headers.get('x-session-id')
-  if (headerSession && headerSession.trim()) return headerSession.trim()
+  const headerKeys = ['x-session-id', 'x-agent-id', 'x-client-id']
+  for (const headerKey of headerKeys) {
+    const headerValue = request.headers.get(headerKey)
+    if (headerValue && headerValue.trim()) return headerValue.trim()
+  }
 
-  const auth = request.headers.get('authorization')
-  if (auth && auth.trim()) return auth.trim()
-
-  const apiKey = request.headers.get('api-key')
-  if (apiKey && apiKey.trim()) return apiKey.trim()
-
-  const xff = request.headers.get('x-forwarded-for') || request.headers.get('x-real-ip') || ''
-  const ip = xff.split(',')[0]?.trim() || 'unknown'
-  const ua = request.headers.get('user-agent') || 'unknown'
-  return `${ip}|${ua}`
+  return null
 }
 
 function toSessionRouteKey(rawSessionKey: string): string {
@@ -205,6 +199,27 @@ function sanitizeBodyForLlamaCpp(upstreamPath: string, body: any, supportsTools:
   return cleaned
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms))
+}
+
+function isBusyBody(text: string): boolean {
+  if (!text) return false
+  const normalized = text.trim().toLowerCase()
+  if (!normalized) return false
+  return normalized.includes('"error":"busy"') || normalized.includes('"error": "busy"') || normalized.includes('busy')
+}
+
+async function isRetryableBusyResponse(response: Response): Promise<boolean> {
+  if (![429, 502, 503].includes(response.status)) return false
+  try {
+    const bodyText = await response.clone().text()
+    return isBusyBody(bodyText)
+  } catch {
+    return false
+  }
+}
+
 async function listServices(): Promise<LlamaService[]> {
   const serviceKeys = await keys('llama:service:*')
   const serviceIds = serviceKeys.map(k => k.slice('llama:service:'.length))
@@ -279,9 +294,9 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
   const dispatchConfig = await getDispatchConfig()
 
   let selected: LlamaService | null = null
-  let sticky: StickyRoute | null = null
   let candidateCount = 0
   let schedulingMode: 'direct' | 'enabled' = 'direct'
+  let retryCandidates: LlamaService[] = []
 
   if (model) {
     const online = services.filter(s => s.status === 'online' && s.enabled !== false)
@@ -300,16 +315,19 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
     const groupName = groups.size === 1 ? Array.from(groups)[0] : null
     const enabledGroup = (dispatchConfig?.replicaGroup || '').trim()
     const schedulingEnabled = Boolean(!hasSinglePrimary && groupName && enabledGroup && enabledGroup === groupName)
+    const baseModelNorm = normalizeModelText(stableCandidates[0]?.model || '')
+    const allSameModelNorm = Boolean(
+      baseModelNorm &&
+        stableCandidates.length > 1 &&
+        stableCandidates.every(s => normalizeModelText(s.model || '') === baseModelNorm)
+    )
+    const allInOneReplicaGroup = groups.size === 1 && Boolean(groupName)
+    const canRetryAcrossCandidates = stableCandidates.length > 1 && (allSameModelNorm || allInOneReplicaGroup || schedulingEnabled)
     schedulingMode = schedulingEnabled ? 'enabled' : 'direct'
+    retryCandidates = canRetryAcrossCandidates ? stableCandidates : []
 
     if (!schedulingEnabled) {
       if (!hasSinglePrimary && stableCandidates.length > 1) {
-        const baseModelNorm = normalizeModelText(stableCandidates[0].model || '')
-        const allSameModelNorm = Boolean(
-          baseModelNorm &&
-            stableCandidates.every(s => normalizeModelText(s.model || '') === baseModelNorm)
-        )
-        const allInOneReplicaGroup = groups.size === 1 && Boolean(groupName)
         if (!allSameModelNorm && !allInOneReplicaGroup) {
           selected = null
         } else {
@@ -320,11 +338,11 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
       }
     } else {
       if (sessionRouteKey && modelRouteKey) {
-        sticky = await getJson<StickyRoute>(KEYS.SESSION_ROUTE(sessionRouteKey, modelRouteKey))
-        if (sticky) {
+        const stickyRoute = await getJson<StickyRoute>(KEYS.SESSION_ROUTE(sessionRouteKey, modelRouteKey))
+        if (stickyRoute) {
           selected =
-            services.find(s => s.status === 'online' && s.enabled !== false && s.id === sticky!.serviceId) ||
-            services.find(s => s.status === 'online' && s.enabled !== false && s.host === sticky!.host && s.port === sticky!.port) ||
+            services.find(s => s.status === 'online' && s.enabled !== false && s.id === stickyRoute.serviceId) ||
+            services.find(s => s.status === 'online' && s.enabled !== false && s.host === stickyRoute.host && s.port === stickyRoute.port) ||
             null
         }
       }
@@ -353,23 +371,10 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
     )
   }
 
-  if (model && sessionRouteKey && modelRouteKey) {
-    const route: StickyRoute = {
-      serviceId: selected.id,
-      host: selected.host,
-      port: selected.port,
-      model: selected.model,
-      updatedAt: Date.now(),
-    }
-    await setJson(KEYS.SESSION_ROUTE(sessionRouteKey, modelRouteKey), route, 2 * 60 * 60 * 1000)
-  }
-
   if (parsedJson && typeof parsedJson === 'object' && parsedJson.model == null && selected.model) {
     parsedJson = { ...parsedJson, model: selected.model }
   }
   parsedJson = sanitizeBodyForLlamaCpp(upstreamPath, parsedJson, Boolean(selected.supportsTools))
-
-  const url = `http://${selected.host}:${selected.port}${upstreamPath}`
 
   const headers = new Headers()
   headers.set('Content-Type', contentType || 'application/json')
@@ -390,22 +395,80 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
       ? JSON.stringify(parsedJson)
       : (rawBuf.length ? rawBuf : undefined)
 
-  let upstreamRes: Response
-  try {
-    upstreamRes = await fetch(url, {
+  const fetchUpstream = async (service: LlamaService) => {
+    const serviceUrl = `http://${service.host}:${service.port}${upstreamPath}`
+    const response = await fetch(serviceUrl, {
       method: 'POST',
       headers,
       body: upstreamBody as any,
     })
+    return { response, serviceUrl }
+  }
+
+  let upstreamRes: Response
+  let selectedUrl = ''
+  try {
+    const result = await fetchUpstream(selected)
+    upstreamRes = result.response
+    selectedUrl = result.serviceUrl
   } catch (error) {
     return NextResponse.json(
       {
         error: 'Upstream fetch failed',
         detail: String(error),
-        upstream: { url, serviceId: selected.id, name: selected.name },
+        upstream: { url: `http://${selected.host}:${selected.port}${upstreamPath}`, serviceId: selected.id, name: selected.name },
       },
       { status: 502 }
     )
+  }
+
+  let retryCount = 0
+  const sameServiceRetryDelays = [150, 350]
+  let finalBusy = await isRetryableBusyResponse(upstreamRes)
+
+  if (finalBusy) {
+    for (const delayMs of sameServiceRetryDelays) {
+      await sleep(delayMs)
+      try {
+        const result = await fetchUpstream(selected)
+        retryCount += 1
+        upstreamRes = result.response
+        selectedUrl = result.serviceUrl
+        finalBusy = await isRetryableBusyResponse(upstreamRes)
+        if (!finalBusy) break
+      } catch {
+        retryCount += 1
+      }
+    }
+  }
+
+  if (finalBusy && retryCandidates.length > 1) {
+    for (const candidate of retryCandidates) {
+      if (candidate.id === selected.id) continue
+      try {
+        const result = await fetchUpstream(candidate)
+        retryCount += 1
+        finalBusy = await isRetryableBusyResponse(result.response)
+        if (finalBusy) continue
+        selected = candidate
+        upstreamRes = result.response
+        selectedUrl = result.serviceUrl
+        break
+      } catch {
+        retryCount += 1
+      }
+    }
+  }
+
+  if (model && sessionRouteKey && modelRouteKey && !finalBusy) {
+    const route: StickyRoute = {
+      serviceId: selected.id,
+      host: selected.host,
+      port: selected.port,
+      model: selected.model,
+      updatedAt: Date.now(),
+    }
+    await setJson(KEYS.SESSION_ROUTE(sessionRouteKey, modelRouteKey), route, 2 * 60 * 60 * 1000)
   }
 
   const resHeaders = new Headers(upstreamRes.headers)
@@ -419,6 +482,8 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
   if (typeof model === 'string') resHeaders.set('x-orchestrator-request-model', model)
   resHeaders.set('x-orchestrator-candidates', String(candidateCount))
   resHeaders.set('x-orchestrator-scheduling', schedulingMode)
+  resHeaders.set('x-orchestrator-retries', String(retryCount))
+  if (selectedUrl) resHeaders.set('x-orchestrator-final-url', selectedUrl)
 
   return new NextResponse(upstreamRes.body, {
     status: upstreamRes.status,
