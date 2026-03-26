@@ -1,5 +1,7 @@
 import { NginxConfig, NginxUpstream, NginxUpstreamServer, LlamaService } from '@/types'
 import { getJson, setJson, KEYS } from './minimemory'
+import { writeFile, mkdir, open } from 'node:fs/promises'
+import path from 'node:path'
 
 // Default Nginx configuration
 const DEFAULT_NGINX_CONFIG: NginxConfig = {
@@ -127,6 +129,7 @@ export function generateNginxConfig(config: NginxConfig): string {
   
   // Default location - route to first upstream or llama_backend
   const defaultUpstream = config.upstreams[0]?.name || 'llama_backend'
+  lines.push('        rewrite ^/v1/v1/(.*)$ /v1/$1 break;')
   lines.push('        location / {')
   lines.push(`            proxy_pass http://${defaultUpstream};`)
   lines.push('            proxy_http_version 1.1;')
@@ -135,6 +138,15 @@ export function generateNginxConfig(config: NginxConfig): string {
   lines.push('            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;')
   lines.push('            proxy_set_header X-Forwarded-Proto $scheme;')
   lines.push('            proxy_set_header Connection "";')
+  lines.push('            set $auth_header $http_authorization;')
+  lines.push('            if ($auth_header = "") {')
+  lines.push('                set $auth_header "Bearer $http_api_key";')
+  lines.push('            }')
+  lines.push('            proxy_set_header Authorization $auth_header;')
+  lines.push('            proxy_set_header api-key $http_api_key;')
+  lines.push('            proxy_buffering off;')
+  lines.push('            proxy_cache off;')
+  lines.push('            proxy_set_header X-Accel-Buffering no;')
   lines.push('        }')
   lines.push('')
   
@@ -154,6 +166,75 @@ export function generateNginxConfig(config: NginxConfig): string {
   lines.push('}')
   
   return lines.join('\n')
+}
+
+export interface WriteNginxFilesResult {
+  nginxConfPath: string
+  servicesSnapshotPath: string
+}
+
+export interface ReadNginxLogResult {
+  logPath: string
+  content: string
+}
+
+export async function readNginxLog(
+  type: 'access' | 'error',
+  lines: number
+): Promise<ReadNginxLogResult> {
+  const logPath =
+    type === 'access'
+      ? (process.env.NGINX_ACCESS_LOG_PATH || '/var/log/nginx/access.log')
+      : (process.env.NGINX_ERROR_LOG_PATH || '/var/log/nginx/error.log')
+
+  const maxLines = Number.isFinite(lines) ? Math.max(1, Math.min(2000, Math.floor(lines))) : 200
+  const fh = await open(logPath, 'r')
+  try {
+    const stat = await fh.stat()
+    const size = stat.size
+    const maxBytes = 512 * 1024
+    const start = Math.max(0, size - maxBytes)
+    const readLen = size - start
+    const buf = Buffer.alloc(readLen)
+    await fh.read(buf, 0, readLen, start)
+    const text = buf.toString('utf8')
+    const all = text.split('\n')
+    const tail = all.slice(Math.max(0, all.length - maxLines)).join('\n')
+    return { logPath, content: tail }
+  } finally {
+    await fh.close()
+  }
+}
+
+export async function writeNginxFiles(
+  config: NginxConfig,
+  services: LlamaService[]
+): Promise<WriteNginxFilesResult> {
+  const projectNginxDir = path.join(process.cwd(), 'nginx')
+  await mkdir(projectNginxDir, { recursive: true })
+
+  const nginxConfPath = process.env.NGINX_CONF_PATH || path.join(projectNginxDir, 'nginx.conf')
+  const servicesSnapshotPath = process.env.NGINX_SERVICES_PATH || path.join(projectNginxDir, 'synced-services.json')
+
+  const nginxConf = generateNginxConfig(config)
+  await writeFile(nginxConfPath, nginxConf, 'utf8')
+
+  const snapshot = {
+    updatedAt: Date.now(),
+    serverPort: config.serverPort,
+    services: services.map(s => ({
+      id: s.id,
+      name: s.name,
+      host: s.host,
+      port: s.port,
+      weight: s.weight,
+      status: s.status,
+      model: s.model,
+    })),
+  }
+  await writeFile(servicesSnapshotPath, JSON.stringify(snapshot, null, 2), 'utf8')
+
+  return { nginxConfPath, servicesSnapshotPath }
 }
 
 /**

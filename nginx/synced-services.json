@@ -1,0 +1,42 @@
+{
+  "updatedAt": 1774489977258,
+  "serverPort": 18081,
+  "services": [
+    {
+      "id": "1774451789288-m97p6k2",
+      "name": "main-llama",
+      "host": "127.0.0.1",
+      "port": 8110,
+      "weight": 5,
+      "status": "online",
+      "model": "Qwen3.5-122B-A10B-GGUF"
+    },
+    {
+      "id": "1774487868181-ee60jc4",
+      "name": "OCR",
+      "host": "127.0.0.1",
+      "port": 8111,
+      "weight": 1,
+      "status": "online",
+      "model": "PaddleOCR-VL-1.5-GGUF"
+    },
+    {
+      "id": "1774488042319-4m9eqw9",
+      "name": "embeddings",
+      "host": "127.0.0.1",
+      "port": 8112,
+      "weight": 1,
+      "status": "online",
+      "model": "multilingual-e5-large-instruct-GGUF-f16"
+    },
+    {
+      "id": "1774488326378-nmalvja",
+      "name": "Mini_LLM",
+      "host": "localhost",
+      "port": 8113,
+      "weight": 8,
+      "status": "online",
+      "model": "Qwen3.5-9B-GGUF"
+    }
+  ]
+}

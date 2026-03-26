@@ -13,6 +13,10 @@ import { NginxConfig } from '@/types'
 export default function NginxPage() {
   const [config, setConfig] = useState<NginxConfig | null>(null)
   const [nginxConf, setNginxConf] = useState('')
+  const [logType, setLogType] = useState<'error' | 'access'>('error')
+  const [logLines, setLogLines] = useState('200')
+  const [logContent, setLogContent] = useState('')
+  const [logLoading, setLogLoading] = useState(false)
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
   const [syncing, setSyncing] = useState(false)
@@ -36,6 +40,25 @@ export default function NginxPage() {
       console.error('Failed to fetch nginx config:', error)
     } finally {
       setLoading(false)
+    }
+  }
+
+  const fetchLogs = async () => {
+    setLogLoading(true)
+    try {
+      const response = await fetch(`/api/nginx?action=logs&type=${logType}&lines=${encodeURIComponent(logLines)}`, {
+        method: 'POST',
+      })
+      const result = await response.json()
+      if (result.success) {
+        setLogContent(result.data.content || '')
+      } else {
+        setLogContent(result.error || '')
+      }
+    } catch (error) {
+      setLogContent(String(error))
+    } finally {
+      setLogLoading(false)
     }
   }
 
@@ -125,6 +148,10 @@ export default function NginxPage() {
   useEffect(() => {
     fetchConfig()
   }, [])
+
+  useEffect(() => {
+    if (!loading) fetchLogs()
+  }, [loading, logType])
 
   if (loading) {
     return (
@@ -288,6 +315,52 @@ export default function NginxPage() {
             value={nginxConf}
             onChange={(e) => setNginxConf(e.target.value)}
             rows={20}
+            className="font-mono text-sm"
+          />
+        </CardContent>
+      </Card>
+
+      <Card className="mt-6">
+        <CardHeader>
+          <CardTitle className="flex items-center justify-between">
+            <span>Nginx 日志</span>
+            <Button variant="outline" onClick={fetchLogs} disabled={logLoading}>
+              <RefreshCw className={`h-4 w-4 mr-2 ${logLoading ? 'animate-spin' : ''}`} />
+              刷新
+            </Button>
+          </CardTitle>
+          <CardDescription>读取服务器日志文件（可通过环境变量配置路径）</CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div className="space-y-2">
+              <Label>日志类型</Label>
+              <Select value={logType} onValueChange={(v: 'error' | 'access') => setLogType(v)}>
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="error">error.log</SelectItem>
+                  <SelectItem value="access">access.log</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="space-y-2">
+              <Label>行数</Label>
+              <Input
+                type="number"
+                min="1"
+                max="2000"
+                value={logLines}
+                onChange={(e) => setLogLines(e.target.value)}
+              />
+            </div>
+          </div>
+
+          <Textarea
+            value={logContent}
+            readOnly
+            rows={16}
             className="font-mono text-sm"
           />
         </CardContent>

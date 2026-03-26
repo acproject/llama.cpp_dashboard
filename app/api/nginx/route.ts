@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { NginxConfig } from '@/types'
-import { getNginxConfig, setNginxConfig, generateNginxConfig, syncServicesToNginx, validateNginxConfig } from '@/lib/nginx-manager'
+import { getNginxConfig, setNginxConfig, generateNginxConfig, syncServicesToNginx, validateNginxConfig, writeNginxFiles, readNginxLog } from '@/lib/nginx-manager'
 import { getJson, keys, KEYS } from '@/lib/minimemory'
 import { LlamaService } from '@/types'
 
@@ -67,7 +67,6 @@ export async function POST(request: NextRequest) {
     const action = body?.action || actionFromQuery
     
     if (action === 'sync') {
-      // Sync all registered services to Nginx upstream
       const serviceKeys = await keys('llama:service:*')
       const serviceIds = serviceKeys.map(k => k.slice('llama:service:'.length))
       const services: LlamaService[] = []
@@ -79,13 +78,16 @@ export async function POST(request: NextRequest) {
       
       const config = await syncServicesToNginx(services)
       const confContent = generateNginxConfig(config)
+      const onlineServices = services.filter(s => s.status === 'online')
+      const written = await writeNginxFiles(config, onlineServices)
       
       return NextResponse.json({
         success: true,
         data: {
           config,
           nginxConf: confContent,
-          syncedServices: services.filter(s => s.status === 'online').length,
+          syncedServices: onlineServices.length,
+          written,
         },
       })
     }
@@ -114,6 +116,26 @@ export async function POST(request: NextRequest) {
           nginxConf: confContent,
         },
       })
+    }
+
+    if (action === 'logs') {
+      const typeFromQuery = searchParams.get('type')
+      const linesFromQuery = searchParams.get('lines')
+      const type = (body?.type || typeFromQuery || 'error') as 'access' | 'error'
+      const lines = Number(body?.lines ?? linesFromQuery ?? 200)
+
+      try {
+        const result = await readNginxLog(type, lines)
+        return NextResponse.json({
+          success: true,
+          data: result,
+        })
+      } catch (error) {
+        return NextResponse.json(
+          { success: false, error: String(error) },
+          { status: 500 }
+        )
+      }
     }
     
     return NextResponse.json(

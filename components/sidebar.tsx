@@ -28,7 +28,7 @@ export function Sidebar() {
     <div className="flex h-full w-64 flex-col bg-card border-r">
       <div className="flex h-16 items-center gap-2 px-6 border-b">
         <div className="h-8 w-8 rounded-lg bg-primary flex items-center justify-center">
-          <span className="text-primary-foreground font-bold text-sm">LL</span>
+          <span className="text-primary-foreground font-bold text-sm">OW</span>
         </div>
         <div>
           <h1 className="text-lg font-semibold">llama.cpp</h1>
