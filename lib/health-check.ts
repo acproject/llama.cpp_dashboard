@@ -25,9 +25,15 @@ export async function checkServiceHealth(
     const timeoutId = setTimeout(() => controller.abort(), timeout)
     
     const url = `http://${service.host}:${service.port}${options.endpoint || HEALTH_CHECK_ENDPOINT}`
+    const headers: Record<string, string> = {}
+    if (service.apiKey) {
+      headers.Authorization = `Bearer ${service.apiKey}`
+      headers['api-key'] = service.apiKey
+    }
     
     const response = await fetch(url, {
       method: 'GET',
+      headers,
       signal: controller.signal,
     })
     
@@ -82,9 +88,15 @@ export async function checkLlamaServer(
     
     // llama.cpp server provides /props endpoint for model info
     const url = `http://${service.host}:${service.port}/props`
+    const headers: Record<string, string> = {}
+    if (service.apiKey) {
+      headers.Authorization = `Bearer ${service.apiKey}`
+      headers['api-key'] = service.apiKey
+    }
     
     const response = await fetch(url, {
       method: 'GET',
+      headers,
       signal: controller.signal,
     })
     

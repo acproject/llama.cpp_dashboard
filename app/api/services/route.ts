@@ -46,10 +46,12 @@ export async function POST(request: NextRequest) {
     const service: LlamaService = {
       id,
       name: body.name || `llama-server-${id.slice(0, 8)}`,
+      description: body.description,
       host: body.host || 'localhost',
       port: body.port || 8080,
       model: body.model || 'unknown',
       modelPath: body.modelPath,
+      apiKey: body.apiKey,
       status: 'offline',
       weight: body.weight || 1,
       capabilities: body.capabilities || [],

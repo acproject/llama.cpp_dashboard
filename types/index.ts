@@ -7,6 +7,7 @@ export interface LlamaService {
   port: number
   model: string
   modelPath?: string
+  apiKey?: string
   status: ServiceStatus
   weight: number
   capabilities: string[]

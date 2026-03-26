@@ -56,9 +56,17 @@ export async function PUT(request: NextRequest) {
 // POST /api/nginx - Sync services to Nginx or validate config
 export async function POST(request: NextRequest) {
   try {
-    const body = await request.json()
+    const { searchParams } = new URL(request.url)
+    const actionFromQuery = searchParams.get('action')
+    let body: any = {}
+    try {
+      body = await request.json()
+    } catch {
+      body = {}
+    }
+    const action = body?.action || actionFromQuery
     
-    if (body.action === 'sync') {
+    if (action === 'sync') {
       // Sync all registered services to Nginx upstream
       const serviceKeys = await keys('llama:service:*')
       const serviceIds = serviceKeys.map(k => k.slice('llama:service:'.length))
@@ -82,7 +90,7 @@ export async function POST(request: NextRequest) {
       })
     }
     
-    if (body.action === 'validate') {
+    if (action === 'validate') {
       const config = await getNginxConfig()
       const confContent = generateNginxConfig(config)
       const validation = validateNginxConfig(confContent)
@@ -96,7 +104,7 @@ export async function POST(request: NextRequest) {
       })
     }
     
-    if (body.action === 'generate') {
+    if (action === 'generate') {
       const config = await getNginxConfig()
       const confContent = generateNginxConfig(config)
       

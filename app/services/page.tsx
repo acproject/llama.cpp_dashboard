@@ -28,6 +28,7 @@ export default function ServicesPage() {
     host: 'localhost',
     port: '8080',
     model: '',
+    apiKey: '',
     weight: '1',
     capabilities: '',
   })
@@ -55,6 +56,7 @@ export default function ServicesPage() {
       host: formData.host,
       port: parseInt(formData.port),
       model: formData.model,
+      apiKey: formData.apiKey,
       weight: parseInt(formData.weight),
       capabilities: formData.capabilities.split(',').map(c => c.trim()).filter(Boolean),
     }
@@ -115,6 +117,7 @@ export default function ServicesPage() {
       host: service.host,
       port: service.port.toString(),
       model: service.model,
+      apiKey: service.apiKey || '',
       weight: service.weight.toString(),
       capabilities: service.capabilities.join(', '),
     })
@@ -128,6 +131,7 @@ export default function ServicesPage() {
       host: 'localhost',
       port: '8080',
       model: '',
+      apiKey: '',
       weight: '1',
       capabilities: '',
     })
@@ -220,6 +224,17 @@ export default function ServicesPage() {
                     step="0.1"
                     value={formData.weight}
                     onChange={(e) => setFormData({ ...formData, weight: e.target.value })}
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="apiKey">API Key (可选)</Label>
+                  <Input
+                    id="apiKey"
+                    type="password"
+                    value={formData.apiKey}
+                    onChange={(e) => setFormData({ ...formData, apiKey: e.target.value })}
+                    placeholder="sk-..."
+                    autoComplete="off"
                   />
                 </div>
                 <div className="space-y-2">

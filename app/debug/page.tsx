@@ -50,17 +50,28 @@ export default function DebugPage() {
     const service = services.find(s => s.id === selectedServiceId)
 
     try {
-      // Call llama server directly
-      const url = `http://${service?.host}:${service?.port}/completion`
+      if (!service) {
+        throw new Error('Service not found')
+      }
+      if (!service.model) {
+        throw new Error('Model is required for /v1/chat/completions')
+      }
+
+      const url = `http://${service.host}:${service.port}/v1/chat/completions`
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+      if (service.apiKey) {
+        headers.Authorization = `Bearer ${service.apiKey}`
+        headers['api-key'] = service.apiKey
+      }
       
       const res = await fetch(url, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify({
-          prompt: prompt,
-          n_predict: 128,
+          model: service.model,
+          messages: [{ role: 'user', content: prompt }],
+          max_tokens: 128,
           temperature: 0.7,
-          stop: ['\n\n'],
         }),
       })
 
@@ -72,7 +83,11 @@ export default function DebugPage() {
       }
 
       const data = await res.json()
-      setResponse(data.content || JSON.stringify(data, null, 2))
+      const content =
+        data?.choices?.[0]?.message?.content ??
+        data?.choices?.[0]?.text ??
+        data?.message?.content
+      setResponse(content || JSON.stringify(data, null, 2))
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
     } finally {
@@ -106,16 +121,25 @@ export default function DebugPage() {
       const service = dispatchData.data.selectedService
 
       // Call the selected service
-      const url = `http://${service.host}:${service.port}/completion`
+      if (!service?.model) {
+        throw new Error('Model is required for /v1/chat/completions')
+      }
+
+      const url = `http://${service.host}:${service.port}/v1/chat/completions`
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+      if (service.apiKey) {
+        headers.Authorization = `Bearer ${service.apiKey}`
+        headers['api-key'] = service.apiKey
+      }
       
       const res = await fetch(url, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify({
-          prompt: prompt,
-          n_predict: 128,
+          model: service.model,
+          messages: [{ role: 'user', content: prompt }],
+          max_tokens: 128,
           temperature: 0.7,
-          stop: ['\n\n'],
         }),
       })
 
@@ -127,7 +151,11 @@ export default function DebugPage() {
       }
 
       const data = await res.json()
-      setResponse(`[通过调度器选择: ${service.name}]\n\n${data.content || JSON.stringify(data, null, 2)}`)
+      const content =
+        data?.choices?.[0]?.message?.content ??
+        data?.choices?.[0]?.text ??
+        data?.message?.content
+      setResponse(`[通过调度器选择: ${service.name}]\n\n${content || JSON.stringify(data, null, 2)}`)
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
     } finally {
