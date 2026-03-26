@@ -17,6 +17,10 @@ export default function NginxPage() {
   const [logLines, setLogLines] = useState('200')
   const [logContent, setLogContent] = useState('')
   const [logLoading, setLogLoading] = useState(false)
+  const [sudoPassword, setSudoPassword] = useState('')
+  const [systemTargetPath, setSystemTargetPath] = useState('/etc/nginx/sites-enabled/llama-orchestrator')
+  const [applying, setApplying] = useState(false)
+  const [applyResult, setApplyResult] = useState('')
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
   const [syncing, setSyncing] = useState(false)
@@ -139,6 +143,56 @@ export default function NginxPage() {
     a.download = 'nginx.conf'
     a.click()
     URL.revokeObjectURL(url)
+  }
+
+  const handleApplySystem = async () => {
+    setApplying(true)
+    setMessage(null)
+    setApplyResult('')
+    try {
+      const response = await fetch('/api/nginx', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'apply',
+          sudoPassword,
+          targetPath: systemTargetPath,
+          syncFirst: true,
+        }),
+      })
+      const result = await response.json()
+      if (result.success) {
+        setConfig(result.data.config)
+        setNginxConf(result.data.nginxConf)
+        setMessage({ type: 'success', text: `已写入并 reload：${result.data.targetPath}` })
+
+        const parts = [
+          `TARGET: ${result.data.targetPath}`,
+          '',
+          `INSTALL exitCode=${result.data.installed?.exitCode}`,
+          String(result.data.installed?.stdout || ''),
+          String(result.data.installed?.stderr || ''),
+          '',
+          `NGINX -t exitCode=${result.data.test?.exitCode}`,
+          String(result.data.test?.stdout || ''),
+          String(result.data.test?.stderr || ''),
+          '',
+          `NGINX reload exitCode=${result.data.reload?.exitCode}`,
+          String(result.data.reload?.stdout || ''),
+          String(result.data.reload?.stderr || ''),
+        ]
+        setApplyResult(parts.join('\n').trim())
+      } else {
+        setMessage({ type: 'error', text: result.error })
+        setApplyResult(String(result.error || ''))
+      }
+    } catch (error) {
+      setMessage({ type: 'error', text: String(error) })
+      setApplyResult(String(error))
+    } finally {
+      setApplying(false)
+      setSudoPassword('')
+    }
   }
 
   const updateConfig = (updates: Partial<NginxConfig>) => {
@@ -317,6 +371,32 @@ export default function NginxPage() {
             rows={20}
             className="font-mono text-sm"
           />
+        </CardContent>
+      </Card>
+
+      <Card className="mt-6">
+        <CardHeader>
+          <CardTitle>应用到系统 Nginx</CardTitle>
+          <CardDescription>会使用 sudo 写入 /etc/nginx 并执行 nginx -t 与 nginx -s reload</CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div className="space-y-2">
+              <Label>目标配置路径</Label>
+              <Input value={systemTargetPath} onChange={(e) => setSystemTargetPath(e.target.value)} />
+            </div>
+            <div className="space-y-2">
+              <Label>sudo 密码</Label>
+              <Input type="password" value={sudoPassword} onChange={(e) => setSudoPassword(e.target.value)} />
+            </div>
+          </div>
+
+          <Button onClick={handleApplySystem} disabled={applying || !sudoPassword}>
+            <RefreshCw className={`h-4 w-4 mr-2 ${applying ? 'animate-spin' : ''}`} />
+            同步并应用
+          </Button>
+
+          <Textarea value={applyResult} readOnly rows={10} className="font-mono text-sm" />
         </CardContent>
       </Card>
 

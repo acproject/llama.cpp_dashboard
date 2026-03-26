@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { NginxConfig } from '@/types'
-import { getNginxConfig, setNginxConfig, generateNginxConfig, syncServicesToNginx, validateNginxConfig, writeNginxFiles, readNginxLog } from '@/lib/nginx-manager'
+import { getNginxConfig, setNginxConfig, generateNginxConfig, syncServicesToNginx, validateNginxConfig, writeNginxFiles, readNginxLog, applySystemNginxConfig } from '@/lib/nginx-manager'
 import { getJson, keys, KEYS } from '@/lib/minimemory'
 import { LlamaService } from '@/types'
 
@@ -136,6 +136,55 @@ export async function POST(request: NextRequest) {
           { status: 500 }
         )
       }
+    }
+
+    if (action === 'apply') {
+      const sudoPassword = String(body?.sudoPassword || body?.password || '')
+      if (!sudoPassword) {
+        return NextResponse.json(
+          { success: false, error: 'Missing sudoPassword' },
+          { status: 400 }
+        )
+      }
+
+      const targetPath = body?.targetPath ? String(body.targetPath) : undefined
+      const syncFirst = body?.syncFirst === undefined ? true : Boolean(body.syncFirst)
+
+      let config: NginxConfig
+      let onlineServices: LlamaService[] = []
+
+      if (syncFirst) {
+        const serviceKeys = await keys('llama:service:*')
+        const serviceIds = serviceKeys.map(k => k.slice('llama:service:'.length))
+        const services: LlamaService[] = []
+        
+        for (const id of serviceIds) {
+          const service = await getJson<LlamaService>(KEYS.SERVICE(id))
+          if (service) services.push(service)
+        }
+
+        config = await syncServicesToNginx(services)
+        onlineServices = services.filter(s => s.status === 'online')
+        await writeNginxFiles(config, onlineServices)
+      } else {
+        config = await getNginxConfig()
+      }
+
+      const applied = await applySystemNginxConfig(sudoPassword, config, targetPath)
+      const confContent = generateNginxConfig(config)
+
+      return NextResponse.json({
+        success: true,
+        data: {
+          targetPath: applied.targetPath,
+          installed: applied.installed,
+          test: applied.test,
+          reload: applied.reload,
+          config,
+          nginxConf: confContent,
+          syncedServices: onlineServices.length,
+        },
+      })
     }
     
     return NextResponse.json(

@@ -1,7 +1,10 @@
 import { NginxConfig, NginxUpstream, NginxUpstreamServer, LlamaService } from '@/types'
 import { getJson, setJson, KEYS } from './minimemory'
-import { writeFile, mkdir, open } from 'node:fs/promises'
+import { writeFile, mkdir, open, unlink } from 'node:fs/promises'
+import { spawn } from 'node:child_process'
 import path from 'node:path'
+import os from 'node:os'
+import { randomUUID } from 'node:crypto'
 
 // Default Nginx configuration
 const DEFAULT_NGINX_CONFIG: NginxConfig = {
@@ -203,6 +206,101 @@ export async function readNginxLog(
     return { logPath, content: tail }
   } finally {
     await fh.close()
+  }
+}
+
+export interface SudoExecResult {
+  command: string
+  args: string[]
+  exitCode: number | null
+  stdout: string
+  stderr: string
+}
+
+function isAllowedNginxTargetPath(targetPath: string): boolean {
+  if (!targetPath.startsWith('/etc/nginx/')) return false
+  return /^\/etc\/nginx\/(sites-enabled|sites-available|conf\.d)\/[A-Za-z0-9._-]+$/.test(targetPath)
+}
+
+async function runSudo(password: string, command: string, args: string[]): Promise<SudoExecResult> {
+  return new Promise((resolve) => {
+    const child = spawn('sudo', ['-S', '-p', '', command, ...args], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+    })
+
+    let stdout = ''
+    let stderr = ''
+
+    child.stdout.setEncoding('utf8')
+    child.stderr.setEncoding('utf8')
+
+    child.stdout.on('data', (chunk) => {
+      stdout += chunk
+    })
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk
+    })
+
+    child.on('close', (code) => {
+      resolve({
+        command,
+        args,
+        exitCode: code,
+        stdout,
+        stderr,
+      })
+    })
+
+    child.stdin.write(`${password}\n`)
+    child.stdin.end()
+  })
+}
+
+export interface ApplySystemNginxResult {
+  targetPath: string
+  installed: SudoExecResult
+  test: SudoExecResult
+  reload: SudoExecResult
+}
+
+export async function applySystemNginxConfig(
+  sudoPassword: string,
+  config: NginxConfig,
+  targetPath?: string
+): Promise<ApplySystemNginxResult> {
+  const resolvedTargetPath =
+    targetPath ||
+    process.env.NGINX_SYSTEM_SITE_PATH ||
+    '/etc/nginx/sites-enabled/llama-orchestrator'
+
+  if (!isAllowedNginxTargetPath(resolvedTargetPath)) {
+    throw new Error('Invalid targetPath')
+  }
+
+  const tmpPath = path.join(os.tmpdir(), `llama-orchestrator-${randomUUID()}.conf`)
+  const content = generateNginxConfig(config)
+  await writeFile(tmpPath, content, 'utf8')
+
+  try {
+    const installed = await runSudo(sudoPassword, 'install', ['-m', '0644', tmpPath, resolvedTargetPath])
+    if (installed.exitCode !== 0) {
+      return {
+        targetPath: resolvedTargetPath,
+        installed,
+        test: { command: 'nginx', args: ['-t'], exitCode: null, stdout: '', stderr: '' },
+        reload: { command: 'nginx', args: ['-s', 'reload'], exitCode: null, stdout: '', stderr: '' },
+      }
+    }
+
+    const test = await runSudo(sudoPassword, 'nginx', ['-t'])
+    if (test.exitCode !== 0) {
+      return { targetPath: resolvedTargetPath, installed, test, reload: { command: 'nginx', args: ['-s', 'reload'], exitCode: null, stdout: '', stderr: '' } }
+    }
+
+    const reload = await runSudo(sudoPassword, 'nginx', ['-s', 'reload'])
+    return { targetPath: resolvedTargetPath, installed, test, reload }
+  } finally {
+    await unlink(tmpPath).catch(() => {})
   }
 }
 
