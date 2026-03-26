@@ -14,6 +14,7 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Textarea } from '@/components/ui/textarea'
+import { Switch } from '@/components/ui/switch'
 import { LlamaService } from '@/types'
 import { formatTimestamp, getStatusBgColor } from '@/lib/utils'
 
@@ -29,6 +30,10 @@ export default function ServicesPage() {
     port: '8080',
     model: '',
     apiKey: '',
+    enabled: true,
+    supportsTools: false,
+    replicaGroup: '',
+    primaryReplica: false,
     weight: '1',
     capabilities: '',
   })
@@ -57,6 +62,10 @@ export default function ServicesPage() {
       port: parseInt(formData.port),
       model: formData.model,
       apiKey: formData.apiKey,
+      enabled: formData.enabled,
+      supportsTools: formData.supportsTools,
+      replicaGroup: formData.replicaGroup.trim() ? formData.replicaGroup.trim() : undefined,
+      primaryReplica: formData.primaryReplica,
       weight: parseInt(formData.weight),
       capabilities: formData.capabilities.split(',').map(c => c.trim()).filter(Boolean),
     }
@@ -118,6 +127,10 @@ export default function ServicesPage() {
       port: service.port.toString(),
       model: service.model,
       apiKey: service.apiKey || '',
+      enabled: service.enabled !== false,
+      supportsTools: Boolean(service.supportsTools),
+      replicaGroup: service.replicaGroup || '',
+      primaryReplica: Boolean(service.primaryReplica),
       weight: service.weight.toString(),
       capabilities: service.capabilities.join(', '),
     })
@@ -132,9 +145,26 @@ export default function ServicesPage() {
       port: '8080',
       model: '',
       apiKey: '',
+      enabled: true,
+      supportsTools: false,
+      replicaGroup: '',
+      primaryReplica: false,
       weight: '1',
       capabilities: '',
     })
+  }
+
+  const handleSetEnabled = async (service: LlamaService, enabled: boolean) => {
+    try {
+      await fetch(`/api/services/${service.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'set-enabled', enabled }),
+      })
+      fetchServices()
+    } catch (error) {
+      console.error('Failed to set enabled:', error)
+    }
   }
 
   useEffect(() => {
@@ -246,6 +276,51 @@ export default function ServicesPage() {
                     placeholder="chat, code, translation"
                   />
                 </div>
+                <div className="space-y-2">
+                  <Label>提供服务</Label>
+                  <div className="flex items-center gap-3">
+                    <Switch
+                      checked={formData.enabled}
+                      onCheckedChange={(checked) => setFormData({ ...formData, enabled: checked })}
+                    />
+                    <span className="text-sm text-muted-foreground">
+                      {formData.enabled ? '启用' : '停用'}
+                    </span>
+                  </div>
+                </div>
+                <div className="space-y-2">
+                  <Label>支持 Tools / tool_choice</Label>
+                  <div className="flex items-center gap-3">
+                    <Switch
+                      checked={formData.supportsTools}
+                      onCheckedChange={(checked) => setFormData({ ...formData, supportsTools: checked })}
+                    />
+                    <span className="text-sm text-muted-foreground">
+                      {formData.supportsTools ? '开启' : '关闭'}
+                    </span>
+                  </div>
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="replicaGroup">分布式组 (可选)</Label>
+                  <Input
+                    id="replicaGroup"
+                    value={formData.replicaGroup}
+                    onChange={(e) => setFormData({ ...formData, replicaGroup: e.target.value })}
+                    placeholder="例如: gpt-4o-main"
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label>主副本 (直连目标)</Label>
+                  <div className="flex items-center gap-3">
+                    <Switch
+                      checked={formData.primaryReplica}
+                      onCheckedChange={(checked) => setFormData({ ...formData, primaryReplica: checked })}
+                    />
+                    <span className="text-sm text-muted-foreground">
+                      {formData.primaryReplica ? '是' : '否'}
+                    </span>
+                  </div>
+                </div>
               </div>
               <div className="space-y-2">
                 <Label htmlFor="description">描述</Label>
@@ -285,7 +360,7 @@ export default function ServicesPage() {
               {services.map((service) => (
                 <div
                   key={service.id}
-                  className="flex items-center justify-between p-4 bg-muted rounded-lg"
+                  className={`flex items-center justify-between p-4 bg-muted rounded-lg ${service.enabled === false ? 'opacity-60' : ''}`}
                 >
                   <div className="flex items-center gap-4">
                     <div className={`h-3 w-3 rounded-full ${getStatusBgColor(service.status)}`} />
@@ -311,11 +386,48 @@ export default function ServicesPage() {
                           ))}
                         </div>
                       )}
+                      {service.supportsTools && (
+                        <div className="flex gap-1 mt-1">
+                          <span className="px-2 py-0.5 bg-primary/10 text-primary text-xs rounded">
+                            tools
+                          </span>
+                        </div>
+                      )}
+                      {service.replicaGroup && (
+                        <div className="flex gap-1 mt-1">
+                          <span className="px-2 py-0.5 bg-primary/10 text-primary text-xs rounded">
+                            group:{service.replicaGroup}
+                          </span>
+                        </div>
+                      )}
+                      {service.primaryReplica && (
+                        <div className="flex gap-1 mt-1">
+                          <span className="px-2 py-0.5 bg-primary/10 text-primary text-xs rounded">
+                            primary
+                          </span>
+                        </div>
+                      )}
+                      {service.enabled === false && (
+                        <div className="flex gap-1 mt-1">
+                          <span className="px-2 py-0.5 bg-primary/10 text-primary text-xs rounded">
+                            disabled
+                          </span>
+                        </div>
+                      )}
                     </div>
                   </div>
                   <div className="flex items-center gap-2">
                     <div className="text-sm text-muted-foreground mr-4">
                       权重: {service.weight}
+                    </div>
+                    <div className="flex items-center gap-2 mr-2">
+                      <span className="text-sm text-muted-foreground">
+                        {service.enabled === false ? '已停用' : '已启用'}
+                      </span>
+                      <Switch
+                        checked={service.enabled !== false}
+                        onCheckedChange={(checked) => handleSetEnabled(service, checked)}
+                      />
                     </div>
                     <Button
                       size="sm"

@@ -44,7 +44,7 @@ export async function GET(request: NextRequest) {
     // Calculate summary
     const summary = {
       totalServices: services.length,
-      onlineServices: services.filter(s => s.status === 'online').length,
+      onlineServices: services.filter(s => s.status === 'online' && s.enabled !== false).length,
       offlineServices: services.filter(s => s.status === 'offline').length,
       errorServices: services.filter(s => s.status === 'error').length,
       totalRequests: Object.values(metricsMap).reduce((sum, m) => sum + m.totalRequests, 0),

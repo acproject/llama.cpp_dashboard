@@ -9,6 +9,8 @@ import { randomUUID } from 'node:crypto'
 // Default Nginx configuration
 const DEFAULT_NGINX_CONFIG: NginxConfig = {
   upstreams: [],
+  replicaGroup: null,
+  nodeProxyBase: process.env.DASHBOARD_PROXY_BASE || 'http://127.0.0.1:3000',
   serverPort: 8080,
   proxyTimeout: 300,
   proxyBufferSize: '128k',
@@ -19,7 +21,7 @@ const DEFAULT_NGINX_CONFIG: NginxConfig = {
  */
 export async function getNginxConfig(): Promise<NginxConfig> {
   const config = await getJson<NginxConfig>(KEYS.NGINX_CONFIG)
-  return config || DEFAULT_NGINX_CONFIG
+  return { ...DEFAULT_NGINX_CONFIG, ...(config || {}) }
 }
 
 /**
@@ -37,7 +39,11 @@ export async function setNginxConfig(config: Partial<NginxConfig>): Promise<Ngin
  */
 export function generateNginxConfig(config: NginxConfig): string {
   const lines: string[] = []
-  const dashboardProxyBase = process.env.DASHBOARD_PROXY_BASE || 'http://127.0.0.1:3000'
+  const dashboardProxyBase = (
+    config.nodeProxyBase ||
+    process.env.DASHBOARD_PROXY_BASE ||
+    'http://127.0.0.1:3000'
+  ).replace(/\/+$/, '')
   
   // Worker processes
   lines.push('worker_processes auto;')
@@ -124,6 +130,7 @@ export function generateNginxConfig(config: NginxConfig): string {
   
   // Client settings
   lines.push(`        client_max_body_size 100M;`)
+  lines.push('        client_body_buffer_size 10M;')
   lines.push(`        proxy_read_timeout ${config.proxyTimeout}s;`)
   lines.push(`        proxy_send_timeout ${config.proxyTimeout}s;`)
   lines.push(`        proxy_connect_timeout ${config.proxyTimeout}s;`)
@@ -131,8 +138,6 @@ export function generateNginxConfig(config: NginxConfig): string {
   lines.push(`        proxy_buffers 4 ${config.proxyBufferSize};`)
   lines.push('')
   
-  // Default location - route to first upstream or llama_backend
-  const defaultUpstream = config.upstreams[0]?.name || 'llama_backend'
   lines.push('        rewrite ^/v1/v1/(.*)$ /v1/$1 break;')
   lines.push('        location = /v1/models {')
   lines.push(`            proxy_pass ${dashboardProxyBase}/api/openai/models;`)
@@ -148,8 +153,26 @@ export function generateNginxConfig(config: NginxConfig): string {
   lines.push('            proxy_set_header Authorization $auth_header;')
   lines.push('            proxy_set_header api-key $http_api_key;')
   lines.push('        }')
+  lines.push('        location ^~ /v1/ {')
+  lines.push(`            proxy_pass ${dashboardProxyBase}/api/openai/v1/;`)
+  lines.push('            proxy_http_version 1.1;')
+  lines.push('            proxy_set_header Host $host;')
+  lines.push('            proxy_set_header X-Real-IP $remote_addr;')
+  lines.push('            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;')
+  lines.push('            proxy_set_header X-Forwarded-Proto $scheme;')
+  lines.push('            set $auth_header $http_authorization;')
+  lines.push('            if ($auth_header = "") {')
+  lines.push('                set $auth_header "Bearer $http_api_key";')
+  lines.push('            }')
+  lines.push('            proxy_set_header Authorization $auth_header;')
+  lines.push('            proxy_set_header api-key $http_api_key;')
+  lines.push('            proxy_request_buffering off;')
+  lines.push('            proxy_buffering off;')
+  lines.push('            proxy_cache off;')
+  lines.push('            proxy_set_header X-Accel-Buffering no;')
+  lines.push('        }')
   lines.push('        location / {')
-  lines.push(`            proxy_pass http://${defaultUpstream};`)
+  lines.push(`            proxy_pass ${dashboardProxyBase};`)
   lines.push('            proxy_http_version 1.1;')
   lines.push('            proxy_set_header Host $host;')
   lines.push('            proxy_set_header X-Real-IP $remote_addr;')
@@ -162,6 +185,7 @@ export function generateNginxConfig(config: NginxConfig): string {
   lines.push('            }')
   lines.push('            proxy_set_header Authorization $auth_header;')
   lines.push('            proxy_set_header api-key $http_api_key;')
+  lines.push('            proxy_request_buffering off;')
   lines.push('            proxy_buffering off;')
   lines.push('            proxy_cache off;')
   lines.push('            proxy_set_header X-Accel-Buffering no;')
@@ -342,6 +366,7 @@ export async function writeNginxFiles(
       port: s.port,
       weight: s.weight,
       status: s.status,
+      enabled: s.enabled !== false,
       model: s.model,
     })),
   }
@@ -383,9 +408,22 @@ export async function syncServicesToNginx(
 ): Promise<NginxConfig> {
   const config = await getNginxConfig()
   
-  // Create default upstream from all online services
-  const onlineServices = services.filter(s => s.status === 'online')
-  const defaultUpstream = createUpstreamFromServices('llama_backend', onlineServices)
+  const eligible = services.filter(s => s.status === 'online' && s.enabled !== false)
+  const stableEligible = [...eligible].sort((a, b) => (a.id || '').localeCompare(b.id || ''))
+
+  const group = (config.replicaGroup || '').trim()
+  let upstreamServices: LlamaService[] = []
+
+  if (group) {
+    upstreamServices = stableEligible.filter(s => (s.replicaGroup || '').trim() === group)
+  } else {
+    const primaries = stableEligible.filter(s => Boolean(s.primaryReplica))
+    upstreamServices = (primaries[0] ? [primaries[0]] : (stableEligible[0] ? [stableEligible[0]] : []))
+  }
+
+  const existing = config.upstreams.find(u => u.name === 'llama_backend')
+  const lb = existing?.loadBalancingMethod || 'round-robin'
+  const defaultUpstream = createUpstreamFromServices('llama_backend', upstreamServices, lb)
   
   // Update or add upstream
   const existingIndex = config.upstreams.findIndex(u => u.name === 'llama_backend')

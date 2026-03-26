@@ -23,14 +23,19 @@ export async function GET() {
       if (service) services.push(service)
     }
     
-    const distribution = calculateLoadDistribution(services.filter(s => s.status === 'online'))
+    const replicaGroup = (config.replicaGroup || '').trim()
+    const online = services.filter(s => s.status === 'online' && s.enabled !== false)
+    const groupOnline = replicaGroup
+      ? online.filter(s => (s.replicaGroup || '').trim() === replicaGroup)
+      : []
+    const distribution = replicaGroup ? calculateLoadDistribution(groupOnline) : {}
     
     return NextResponse.json({
       success: true,
       data: {
         config,
         distribution,
-        onlineServices: services.filter(s => s.status === 'online').length,
+        onlineServices: replicaGroup ? groupOnline.length : online.length,
       },
     })
   } catch (error) {
@@ -73,13 +78,19 @@ export async function POST(request: NextRequest) {
       if (service) services.push(service)
     }
     
+    const config = await getDispatchConfig()
+    const replicaGroup = (config.replicaGroup || '').trim()
+    const candidateServices = replicaGroup
+      ? services.filter(s => (s.replicaGroup || '').trim() === replicaGroup)
+      : services
+
     // Select service
     let selectedService: LlamaService | null = null
     
     if (body.capability) {
-      selectedService = await selectServiceByCapability(services, body.capability)
+      selectedService = await selectServiceByCapability(candidateServices, body.capability)
     } else {
-      selectedService = await selectService(services)
+      selectedService = await selectService(candidateServices)
     }
     
     if (!selectedService) {

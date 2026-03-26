@@ -8,6 +8,10 @@ export interface LlamaService {
   model: string
   modelPath?: string
   apiKey?: string
+  enabled?: boolean
+  supportsTools?: boolean
+  replicaGroup?: string
+  primaryReplica?: boolean
   status: ServiceStatus
   weight: number
   capabilities: string[]
@@ -68,6 +72,7 @@ export type DispatchStrategy = 'round-robin' | 'least-connections' | 'weighted' 
 
 export interface DispatchConfig {
   strategy: DispatchStrategy
+  replicaGroup?: string | null
   defaultWeight: number
   healthCheckInterval: number
   healthCheckTimeout: number
@@ -95,6 +100,8 @@ export interface NginxUpstreamServer {
 
 export interface NginxConfig {
   upstreams: NginxUpstream[]
+  replicaGroup?: string | null
+  nodeProxyBase?: string
   serverPort: number
   proxyTimeout: number
   proxyBufferSize: string

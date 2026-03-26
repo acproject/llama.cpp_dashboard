@@ -13,7 +13,7 @@ export async function GET() {
   }
 
   const models = services
-    .filter(s => s.status === 'online')
+    .filter(s => s.status === 'online' && s.enabled !== false)
     .map(s => ({
       id: s.model || `${s.host}:${s.port}`,
       object: 'model',
@@ -26,4 +26,3 @@ export async function GET() {
     data: models,
   })
 }
-

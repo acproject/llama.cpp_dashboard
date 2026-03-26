@@ -59,6 +59,10 @@ export default function ConfigPage() {
     setConfig(prev => prev ? { ...prev, ...updates } : prev)
   }
 
+  const replicaGroups = Array.from(
+    new Set(services.map(s => (s.replicaGroup || '').trim()).filter(Boolean))
+  ).sort((a, b) => a.localeCompare(b))
+
   useEffect(() => {
     fetchData()
   }, [])
@@ -92,14 +96,40 @@ export default function ConfigPage() {
         <Card>
           <CardHeader>
             <CardTitle>调度策略</CardTitle>
-            <CardDescription>选择服务请求的分发策略</CardDescription>
+            <CardDescription>默认直连；仅对同一分布式组 (replicaGroup) 开启调度</CardDescription>
           </CardHeader>
           <CardContent className="space-y-6">
+            <div className="space-y-2">
+              <Label>分布式组 (replicaGroup)</Label>
+              <Select
+                value={config?.replicaGroup ? config.replicaGroup : '__direct__'}
+                onValueChange={(value: string) =>
+                  updateConfig({ replicaGroup: value === '__direct__' ? null : value.trim() })
+                }
+              >
+                <SelectTrigger>
+                  <SelectValue placeholder="直连 (默认)" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="__direct__">直连 (默认)</SelectItem>
+                  {replicaGroups.map(g => (
+                    <SelectItem key={g} value={g}>
+                      {g}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <p className="text-sm text-muted-foreground">
+                未选择分布式组时，不启用调度策略；同名模型多服务默认直连到主副本（若配置）或按端口优先固定选择一个
+              </p>
+            </div>
+
             <div className="space-y-2">
               <Label>负载均衡策略</Label>
               <Select
                 value={config?.strategy || 'weighted'}
                 onValueChange={(value: DispatchStrategy) => updateConfig({ strategy: value })}
+                disabled={!config?.replicaGroup}
               >
                 <SelectTrigger>
                   <SelectValue />
@@ -112,6 +142,7 @@ export default function ConfigPage() {
                 </SelectContent>
               </Select>
               <p className="text-sm text-muted-foreground">
+                {!config?.replicaGroup && '直连模式下无需选择策略'}
                 {config?.strategy === 'weighted' && '根据权重随机选择服务，权重高的服务获得更多请求'}
                 {config?.strategy === 'round-robin' && '按顺序轮流选择服务'}
                 {config?.strategy === 'least-connections' && '选择当前连接数最少的服务'}
@@ -128,6 +159,7 @@ export default function ConfigPage() {
                 step="0.1"
                 value={config?.defaultWeight || 1}
                 onChange={(e) => updateConfig({ defaultWeight: parseFloat(e.target.value) })}
+                disabled={!config?.replicaGroup}
               />
               <p className="text-sm text-muted-foreground">
                 新服务的默认权重值
@@ -200,13 +232,19 @@ export default function ConfigPage() {
           <CardDescription>当前权重下的预期负载分布</CardDescription>
         </CardHeader>
         <CardContent>
-          {services.length === 0 ? (
+          {!config?.replicaGroup ? (
             <div className="text-center py-4 text-muted-foreground">
-              暂无在线服务
+              直连模式不展示负载分布
+            </div>
+          ) : services.filter(s => (s.replicaGroup || '').trim() === (config.replicaGroup || '').trim()).length === 0 ? (
+            <div className="text-center py-4 text-muted-foreground">
+              当前分布式组暂无服务
             </div>
           ) : (
             <div className="space-y-4">
-              {services.map((service) => (
+              {services
+                .filter(s => (s.replicaGroup || '').trim() === (config.replicaGroup || '').trim())
+                .map((service) => (
                 <div key={service.id} className="space-y-2">
                   <div className="flex items-center justify-between text-sm">
                     <span className="font-medium">{service.name}</span>

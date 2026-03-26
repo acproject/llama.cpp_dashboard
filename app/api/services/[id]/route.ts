@@ -140,6 +140,22 @@ export async function PATCH(
         },
       })
     }
+
+    if (body.action === 'set-enabled') {
+      const enabled = Boolean(body.enabled)
+      const updated: LlamaService = {
+        ...service,
+        enabled,
+        updatedAt: Date.now(),
+      }
+
+      await setJson(KEYS.SERVICE(id), updated)
+
+      return NextResponse.json({
+        success: true,
+        data: updated,
+      })
+    }
     
     return NextResponse.json(
       { success: false, error: 'Unknown action' },

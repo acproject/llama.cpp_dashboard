@@ -18,7 +18,7 @@ export async function GET() {
       if (service) services.push(service)
     }
     
-    const onlineCount = services.filter(s => s.status === 'online').length
+    const onlineCount = services.filter(s => s.status === 'online' && s.enabled !== false).length
     
     return NextResponse.json({
       success: true,

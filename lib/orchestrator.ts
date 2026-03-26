@@ -4,6 +4,7 @@ import { getJson, setJson, incr, KEYS } from './minimemory'
 // Default dispatch configuration
 const DEFAULT_CONFIG: DispatchConfig = {
   strategy: 'weighted',
+  replicaGroup: null,
   defaultWeight: 1,
   healthCheckInterval: 10000, // 10 seconds
   healthCheckTimeout: 5000, // 5 seconds
@@ -19,7 +20,7 @@ let roundRobinIndex = 0
  */
 export async function getDispatchConfig(): Promise<DispatchConfig> {
   const config = await getJson<DispatchConfig>(KEYS.DISPATCH_CONFIG)
-  return config || DEFAULT_CONFIG
+  return { ...DEFAULT_CONFIG, ...(config || {}) }
 }
 
 /**
@@ -42,7 +43,7 @@ export async function selectService(
   if (services.length === 0) return null
   
   // Filter only online services
-  const onlineServices = services.filter(s => s.status === 'online')
+  const onlineServices = services.filter(s => s.status === 'online' && s.enabled !== false)
   if (onlineServices.length === 0) return null
   
   const config = await getDispatchConfig()
@@ -71,7 +72,7 @@ export async function selectServiceByCapability(
   capability: string
 ): Promise<LlamaService | null> {
   const onlineServices = services.filter(s => 
-    s.status === 'online' && s.capabilities.includes(capability)
+    s.status === 'online' && s.enabled !== false && s.capabilities.includes(capability)
   )
   
   if (onlineServices.length === 0) return null

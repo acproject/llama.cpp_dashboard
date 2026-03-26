@@ -8,10 +8,11 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Textarea } from '@/components/ui/textarea'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
-import { NginxConfig } from '@/types'
+import { LlamaService, NginxConfig } from '@/types'
 
 export default function NginxPage() {
   const [config, setConfig] = useState<NginxConfig | null>(null)
+  const [services, setServices] = useState<LlamaService[]>([])
   const [nginxConf, setNginxConf] = useState('')
   const [logType, setLogType] = useState<'error' | 'access'>('error')
   const [logLines, setLogLines] = useState('200')
@@ -26,6 +27,8 @@ export default function NginxPage() {
   const [syncing, setSyncing] = useState(false)
   const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
 
+  const DIRECT_VALUE = '__direct__'
+
   const fetchConfig = async () => {
     try {
       const response = await fetch('/api/nginx')
@@ -39,6 +42,12 @@ export default function NginxPage() {
       const confResult = await confResponse.json()
       if (confResult.success) {
         setNginxConf(confResult.data.nginxConf)
+      }
+
+      const servicesResponse = await fetch('/api/services')
+      const servicesResult = await servicesResponse.json()
+      if (servicesResult.success) {
+        setServices(servicesResult.data || [])
       }
     } catch (error) {
       console.error('Failed to fetch nginx config:', error)
@@ -203,6 +212,10 @@ export default function NginxPage() {
     fetchConfig()
   }, [])
 
+  const replicaGroups = Array.from(
+    new Set(services.map(s => (s.replicaGroup || '').trim()).filter(Boolean))
+  ).sort()
+
   useEffect(() => {
     if (!loading) fetchLogs()
   }, [loading, logType])
@@ -223,7 +236,7 @@ export default function NginxPage() {
       <div className="flex items-center justify-between mb-8">
         <div>
           <h1 className="text-3xl font-bold">Nginx 配置</h1>
-          <p className="text-muted-foreground mt-1">管理 Nginx 反向代理配置</p>
+          <p className="text-muted-foreground mt-1">Nginx 作为入口反代到 Node.js 服务端口（如 3000），由 Node.js 再调度到 8110-8113</p>
         </div>
         <div className="flex gap-2">
           <Button variant="outline" onClick={handleSync} disabled={syncing}>
@@ -261,9 +274,19 @@ export default function NginxPage() {
         <Card>
           <CardHeader>
             <CardTitle>服务器配置</CardTitle>
-            <CardDescription>Nginx 服务器基本参数</CardDescription>
+            <CardDescription>Nginx 入口参数与反代目标（Node.js）</CardDescription>
           </CardHeader>
           <CardContent className="space-y-6">
+            <div className="space-y-2">
+              <Label>Node 服务地址</Label>
+              <Input
+                value={(config?.nodeProxyBase || '').trim() ? (config?.nodeProxyBase || '').trim() : 'http://127.0.0.1:3000'}
+                onChange={(e) => updateConfig({ nodeProxyBase: e.target.value })}
+              />
+              <p className="text-sm text-muted-foreground">
+                Nginx 将 /v1/* 转发到该 Node 地址的 /api/openai/v1/*，服务调度在 Node 内完成
+              </p>
+            </div>
             <div className="space-y-2">
               <Label>监听端口</Label>
               <Input
@@ -304,6 +327,30 @@ export default function NginxPage() {
             <CardDescription>负载均衡上游服务器组配置</CardDescription>
           </CardHeader>
           <CardContent className="space-y-6">
+            <div className="space-y-2">
+              <Label>Replica Group</Label>
+              <Select
+                value={(config?.replicaGroup || '').trim() ? (config?.replicaGroup || '').trim() : DIRECT_VALUE}
+                onValueChange={(value: string) =>
+                  updateConfig({ replicaGroup: value === DIRECT_VALUE ? null : value.trim() })
+                }
+              >
+                <SelectTrigger>
+                  <SelectValue placeholder="直连 (默认)" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value={DIRECT_VALUE}>直连 (默认)</SelectItem>
+                  {replicaGroups.map(g => (
+                    <SelectItem key={g} value={g}>
+                      {g}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <p className="text-sm text-muted-foreground">
+                直连模式只同步一个目标服务；选择 Replica Group 后才会把组内副本写入 upstream 并启用负载均衡
+              </p>
+            </div>
             {config?.upstreams.map((upstream, index) => (
               <div key={upstream.name} className="p-4 bg-muted rounded-lg space-y-4">
                 <div className="flex items-center justify-between">
@@ -317,6 +364,7 @@ export default function NginxPage() {
                   <Label>负载均衡方式</Label>
                   <Select
                     value={upstream.loadBalancingMethod}
+                    disabled={!((config?.replicaGroup || '').trim())}
                     onValueChange={(value: 'round-robin' | 'least-conn' | 'ip-hash') => {
                       const newUpstreams = [...(config?.upstreams || [])]
                       newUpstreams[index] = { ...upstream, loadBalancingMethod: value }
@@ -351,7 +399,7 @@ export default function NginxPage() {
 
             {(!config?.upstreams || config.upstreams.length === 0) && (
               <div className="text-center py-4 text-muted-foreground">
-                点击"同步服务"按钮将在线服务同步到 Nginx
+                点击“同步服务”按钮将在线服务同步到 Nginx
               </div>
             )}
           </CardContent>

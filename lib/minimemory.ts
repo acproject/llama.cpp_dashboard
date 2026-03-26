@@ -16,6 +16,9 @@ export const KEYS = {
   NGINX_BACKUP: (id: string) => `llama:nginx:backup:${id}`,
   REQUEST_COUNTER: (id: string) => `llama:counter:${id}`,
   LOGS: (id: string) => `llama:logs:${id}`,
+  SESSION_ROUTE: (sessionKey: string, modelKey?: string) =>
+    `llama:session-route:${sessionKey}${modelKey ? `:${modelKey}` : ''}`,
+  REPLICA_RR: (replicaGroup: string) => `llama:replica-rr:${replicaGroup}`,
 }
 
 // Singleton client

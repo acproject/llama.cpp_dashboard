@@ -78,15 +78,23 @@ export async function POST(request: NextRequest) {
       
       const config = await syncServicesToNginx(services)
       const confContent = generateNginxConfig(config)
-      const onlineServices = services.filter(s => s.status === 'online')
-      const written = await writeNginxFiles(config, onlineServices)
+      const upstream = config.upstreams.find(u => u.name === 'llama_backend')
+      const syncedServices = upstream?.servers.length || 0
+      const used = upstream
+        ? services.filter(s =>
+            upstream.servers.some(us => us.host === s.host && us.port === s.port) &&
+            s.status === 'online' &&
+            s.enabled !== false
+          )
+        : []
+      const written = await writeNginxFiles(config, used)
       
       return NextResponse.json({
         success: true,
         data: {
           config,
           nginxConf: confContent,
-          syncedServices: onlineServices.length,
+          syncedServices,
           written,
         },
       })
@@ -151,7 +159,7 @@ export async function POST(request: NextRequest) {
       const syncFirst = body?.syncFirst === undefined ? true : Boolean(body.syncFirst)
 
       let config: NginxConfig
-      let onlineServices: LlamaService[] = []
+      let syncedServices = 0
 
       if (syncFirst) {
         const serviceKeys = await keys('llama:service:*')
@@ -164,8 +172,16 @@ export async function POST(request: NextRequest) {
         }
 
         config = await syncServicesToNginx(services)
-        onlineServices = services.filter(s => s.status === 'online')
-        await writeNginxFiles(config, onlineServices)
+        const upstream = config.upstreams.find(u => u.name === 'llama_backend')
+        syncedServices = upstream?.servers.length || 0
+        const used = upstream
+          ? services.filter(s =>
+              upstream.servers.some(us => us.host === s.host && us.port === s.port) &&
+              s.status === 'online' &&
+              s.enabled !== false
+            )
+          : []
+        await writeNginxFiles(config, used)
       } else {
         config = await getNginxConfig()
       }
@@ -182,7 +198,7 @@ export async function POST(request: NextRequest) {
           reload: applied.reload,
           config,
           nginxConf: confContent,
-          syncedServices: onlineServices.length,
+          syncedServices,
         },
       })
     }
