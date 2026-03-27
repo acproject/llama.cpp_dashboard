@@ -8,7 +8,9 @@ import {
   Bug, 
   Settings, 
   Globe,
-  LayoutDashboard 
+  LayoutDashboard,
+  Bot,
+  Route
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
@@ -16,6 +18,8 @@ const navigation = [
   { name: '总览', href: '/', icon: LayoutDashboard },
   { name: '服务监控', href: '/monitor', icon: Activity },
   { name: '服务管理', href: '/services', icon: Server },
+  { name: '运行态', href: '/runs', icon: Route },
+  { name: 'Agent注册', href: '/agents', icon: Bot },
   { name: '服务调试', href: '/debug', icon: Bug },
   { name: '调度配置', href: '/config', icon: Settings },
   { name: 'Nginx配置', href: '/nginx', icon: Globe },

@@ -1,5 +1,5 @@
 import { LlamaService, DispatchConfig, DispatchStrategy } from '@/types'
-import { getJson, setJson, incr, KEYS } from './minimemory'
+import { getJson, setJson, incr, getNumber, KEYS } from './minimemory'
 
 // Default dispatch configuration
 const DEFAULT_CONFIG: DispatchConfig = {
@@ -110,7 +110,7 @@ function selectWeighted(services: LlamaService[]): LlamaService {
 }
 
 /**
- * Select service with least connections (based on request counter)
+ * Select service with least connections
  */
 async function selectLeastConnections(services: LlamaService[]): Promise<LlamaService> {
   let minConnections = Infinity
@@ -131,17 +131,14 @@ async function selectLeastConnections(services: LlamaService[]): Promise<LlamaSe
  * Get connection count for a service
  */
 export async function getConnectionCount(serviceId: string): Promise<number> {
-  const count = await incr(KEYS.REQUEST_COUNTER(serviceId))
-  // Decrement after a simulated "connection duration"
-  // In real implementation, this would be tied to actual request lifecycle
-  return count
+  return await getNumber(KEYS.SERVICE_ACTIVE(serviceId))
 }
 
 /**
  * Increment request counter
  */
 export async function incrementRequestCounter(serviceId: string): Promise<void> {
-  await incr(KEYS.REQUEST_COUNTER(serviceId))
+  await incr(KEYS.SERVICE_TOTAL(serviceId))
 }
 
 /**

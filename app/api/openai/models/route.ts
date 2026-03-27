@@ -1,8 +1,8 @@
-import { NextResponse } from 'next/server'
+import { NextRequest, NextResponse } from 'next/server'
 import { getJson, keys, KEYS } from '@/lib/minimemory'
-import { LlamaService } from '@/types'
+import { AgentProfile, LlamaService } from '@/types'
 
-export async function GET() {
+export async function GET(request: NextRequest) {
   const serviceKeys = await keys('llama:service:*')
   const serviceIds = serviceKeys.map(k => k.slice('llama:service:'.length))
 
@@ -12,7 +12,19 @@ export async function GET() {
     if (service) services.push(service)
   }
 
-  const models = services
+  const requestedAgentId = request.headers.get('x-agent-profile')
+  const agent = requestedAgentId ? await getJson<AgentProfile>(KEYS.AGENT(requestedAgentId)) : null
+  const scopedServices = !agent
+    ? services
+    : services.filter(service => {
+        if (service.status !== 'online' || service.enabled === false) return false
+        if (!agent.enabled) return false
+        if (agent.serviceIds.length > 0 && !agent.serviceIds.includes(service.id)) return false
+        if (agent.capabilities.length > 0 && !agent.capabilities.some(capability => service.capabilities.includes(capability))) return false
+        return true
+      })
+
+  const models = scopedServices
     .filter(s => s.status === 'online' && s.enabled !== false)
     .map(s => ({
       id: s.model || `${s.host}:${s.port}`,

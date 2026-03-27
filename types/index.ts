@@ -80,6 +80,113 @@ export interface DispatchConfig {
   retryDelay: number
 }
 
+export interface AgentProfile {
+  id: string
+  name: string
+  description?: string
+  role?: string
+  systemPrompt?: string
+  defaultModel?: string
+  preferredServiceId?: string
+  enabled: boolean
+  serviceIds: string[]
+  capabilities: string[]
+  tools: string[]
+  createdAt: number
+  updatedAt: number
+  metadata?: Record<string, unknown>
+}
+
+export type RunStatus = 'received' | 'routed' | 'running' | 'completed' | 'failed'
+
+export type RunEventType = 'received' | 'parsed' | 'routed' | 'retry' | 'completed' | 'failed'
+
+export interface RunRecord {
+  id: string
+  status: RunStatus
+  upstreamPath: string
+  method: string
+  agentId?: string
+  agentName?: string
+  model?: string
+  sessionId?: string
+  sessionRouteKey?: string
+  modelRouteKey?: string
+  serviceId?: string
+  serviceName?: string
+  serviceHost?: string
+  servicePort?: number
+  schedulingMode?: 'direct' | 'enabled'
+  candidateCount: number
+  retryCount: number
+  startedAt: number
+  completedAt?: number
+  latencyMs?: number
+  error?: string
+}
+
+export interface RunEvent {
+  runId: string
+  type: RunEventType
+  timestamp: number
+  serviceId?: string
+  serviceName?: string
+  detail?: string
+  metadata?: Record<string, unknown>
+}
+
+export interface SessionRecord {
+  sessionId: string
+  currentRunId?: string
+  lastRunId?: string
+  lastModel?: string
+  boundServiceId?: string
+  updatedAt: number
+}
+
+export interface ServiceRuntimeStats {
+  serviceId: string
+  activeRequests: number
+  totalRequests: number
+  failedRequests: number
+  lastRunAt?: number
+  lastErrorAt?: number
+}
+
+export interface RuntimeSummary {
+  recentRuns: number
+  activeRequests: number
+  activeSessions: number
+  totalRuntimeRequests: number
+  failedRuntimeRequests: number
+}
+
+export interface SessionBindingView extends SessionRecord {
+  serviceName?: string
+  serviceHost?: string
+  servicePort?: number
+}
+
+export interface MonitorData {
+  services: LlamaService[]
+  metrics: Record<string, ServiceMetrics>
+  health: Record<string, HealthCheckResult>
+  summary: {
+    totalServices: number
+    onlineServices: number
+    offlineServices: number
+    errorServices: number
+    totalRequests: number
+    avgResponseTime: number
+  }
+  runtime: {
+    runs: RunRecord[]
+    sessions: SessionBindingView[]
+    serviceStats: Record<string, ServiceRuntimeStats>
+    summary: RuntimeSummary
+  }
+}
+
 // Nginx Types
 export interface NginxUpstream {
   name: string

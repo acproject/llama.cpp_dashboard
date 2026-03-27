@@ -19,37 +19,50 @@ export const KEYS = {
   SESSION_ROUTE: (sessionKey: string, modelKey?: string) =>
     `llama:session-route:${sessionKey}${modelKey ? `:${modelKey}` : ''}`,
   REPLICA_RR: (replicaGroup: string) => `llama:replica-rr:${replicaGroup}`,
+  RUN: (id: string) => `agent:run:${id}`,
+  RUN_EVENTS: (id: string) => `agent:run:events:${id}`,
+  SESSION: (id: string) => `agent:session:${id}`,
+  AGENT_SESSION_ROUTE: (sessionId: string, modelKey?: string) =>
+    `agent:session-route:${sessionId}${modelKey ? `:${modelKey}` : ''}`,
+  AGENTS: 'agent:profiles',
+  AGENT: (id: string) => `agent:profile:${id}`,
+  AGENT_GRAPH: (id: string) => `agent:graph:${id}`,
+  SERVICE_ACTIVE: (id: string) => `agent:service:active:${id}`,
+  SERVICE_TOTAL: (id: string) => `agent:service:total:${id}`,
+  SERVICE_ERROR: (id: string) => `agent:service:error:${id}`,
+  RUNS_RECENT: 'agent:runs:recent',
+  RUNS_BY_SESSION: (sessionId: string) => `agent:runs:by-session:${sessionId}`,
+  RUNS_BY_SERVICE: (serviceId: string) => `agent:runs:by-service:${serviceId}`,
 }
 
-// Singleton client
-let client: MiniMemoryClient | null = null
-
 export function getClient(): MiniMemoryClient {
-  if (!client) {
-    const options: MiniMemoryClientOptions = {
-      host: MINIMEMORY_HOST,
-      port: MINIMEMORY_PORT,
-      connectTimeoutMs: 5000,
-      commandTimeoutMs: 10000,
-    }
-    client = createClient(options)
+  const options: MiniMemoryClientOptions = {
+    host: MINIMEMORY_HOST,
+    port: MINIMEMORY_PORT,
+    connectTimeoutMs: 5000,
+    commandTimeoutMs: 10000,
   }
-  return client
+  return createClient(options)
 }
 
 export async function closeClient(): Promise<void> {
-  if (client) {
-    await client.disconnect()
-    client = null
+  return
+}
+
+async function withClient<T>(callback: (client: MiniMemoryClient) => Promise<T>): Promise<T> {
+  const client = getClient()
+  await client.connect()
+  try {
+    return await callback(client)
+  } finally {
+    await client.disconnect().catch(() => undefined)
   }
 }
 
 // Connection test
 export async function testConnection(): Promise<{ success: boolean; error?: string }> {
   try {
-    const c = getClient()
-    await c.connect()
-    const result = await c.ping()
+    const result = await withClient(async (client) => client.set('llama:connection:test', '1'))
     return { success: result === 'PONG' || result === 'OK' }
   } catch (error) {
     return { success: false, error: String(error) }
@@ -59,9 +72,8 @@ export async function testConnection(): Promise<{ success: boolean; error?: stri
 // Health check
 export async function ping(): Promise<boolean> {
   try {
-    const c = getClient()
-    const result = await c.ping()
-    return result === 'PONG' || result === 'OK'
+    const result = await withClient(async (client) => client.set('llama:ping:test', '1'))
+    return result === 'OK'
   } catch {
     return false
   }
@@ -69,8 +81,7 @@ export async function ping(): Promise<boolean> {
 
 // Helper functions for JSON operations
 export async function getJson<T>(key: string): Promise<T | null> {
-  const c = getClient()
-  const data = await c.get(key)
+  const data = await withClient(async (client) => client.get(key))
   if (!data) return null
   try {
     const str = Buffer.isBuffer(data) ? data.toString('utf-8') : String(data)
@@ -81,55 +92,70 @@ export async function getJson<T>(key: string): Promise<T | null> {
 }
 
 export async function setJson<T>(key: string, value: T, ttlMs?: number): Promise<void> {
-  const c = getClient()
-  const data = JSON.stringify(value)
-  await c.set(key, data)
-  if (ttlMs) {
-    await c.pexpire(key, ttlMs)
-  }
+  await withClient(async (client) => {
+    const data = JSON.stringify(value)
+    await client.set(key, data)
+    if (ttlMs) {
+      await client.pexpire(key, ttlMs)
+    }
+  })
 }
 
 export async function deleteKey(key: string): Promise<void> {
-  const c = getClient()
-  await c.del(key)
+  await withClient(async (client) => {
+    await client.del(key)
+  })
 }
 
 export async function existsKey(key: string): Promise<boolean> {
-  const c = getClient()
-  const result = await c.exists(key)
+  const result = await withClient(async (client) => client.exists(key))
   return result === 1
 }
 
 // Counter operations
 export async function incr(key: string): Promise<number> {
-  const c = getClient()
-  return await c.incr(key)
+  return await withClient(async (client) => client.incr(key))
 }
 
 export async function incrBy(key: string, increment: number): Promise<number> {
-  const c = getClient()
-  const result = await c.call(['INCRBY', key, String(increment)])
+  const result = await withClient(async (client) => client.call(['INCRBY', key, String(increment)]))
   return Number(result) || 0
+}
+
+export async function decr(key: string): Promise<number> {
+  return decrBy(key, 1)
+}
+
+export async function decrBy(key: string, decrement: number): Promise<number> {
+  const current = await getNumber(key)
+  const next = current - decrement
+  await setJson(key, next)
+  return next
+}
+
+export async function getNumber(key: string): Promise<number> {
+  const result = await withClient(async (client) => client.get(key))
+  if (result === null || result === undefined) return 0
+  const value = Buffer.isBuffer(result) ? result.toString('utf-8') : String(result)
+  const parsed = Number(value)
+  return Number.isFinite(parsed) ? parsed : 0
 }
 
 // Set operations for service registry
 export async function sadd(key: string, ...members: string[]): Promise<number> {
-  const c = getClient()
   const args = ['SADD', key, ...members]
-  const result = await c.call(args)
+  const result = await withClient(async (client) => client.call(args))
   return Number(result) || 0
 }
 
 export async function srem(key: string, ...members: string[]): Promise<number> {
-  const c = getClient()
   const args = ['SREM', key, ...members]
-  const result = await c.call(args)
+  const result = await withClient(async (client) => client.call(args))
   return Number(result) || 0
 }
 
 export async function smembers(key: string): Promise<string[]> {
-  const c = getClient()
-  const result = await c.call(['SMEMBERS', key])
+  const result = await withClient(async (client) => client.call(['SMEMBERS', key]))
   if (Array.isArray(result)) {
     return result.map((r: unknown) => Buffer.isBuffer(r) ? r.toString('utf-8') : String(r))
   }
@@ -137,15 +163,13 @@ export async function smembers(key: string): Promise<string[]> {
 }
 
 export async function sismember(key: string, member: string): Promise<boolean> {
-  const c = getClient()
-  const result = await c.call(['SISMEMBER', key, member])
+  const result = await withClient(async (client) => client.call(['SISMEMBER', key, member]))
   return result === 1 || result === '1'
 }
 
 // Keys pattern matching
 export async function keys(pattern: string): Promise<string[]> {
-  const c = getClient()
-  const result = await c.keys(pattern)
+  const result = await withClient(async (client) => client.keys(pattern))
   if (Array.isArray(result)) {
     return result.map((r: unknown) => Buffer.isBuffer(r) ? r.toString('utf-8') : String(r))
   }
@@ -154,50 +178,42 @@ export async function keys(pattern: string): Promise<string[]> {
 
 // Metadata operations (MiniMemory specific)
 export async function metaset(subject: string, field: string, value: string): Promise<string> {
-  const c = getClient()
-  return await c.metaset(subject, field, value)
+  return await withClient(async (client) => client.metaset(subject, field, value))
 }
 
 export async function metaget(subject: string, field: string): Promise<string | null> {
-  const c = getClient()
-  const result = await c.metaget(subject, field)
+  const result = await withClient(async (client) => client.metaget(subject, field))
   if (result === null) return null
   return Buffer.isBuffer(result) ? result.toString('utf-8') : String(result)
 }
 
 // Graph operations (MiniMemory specific)
 export async function graphAddEdge(from: string, rel: string, to: string): Promise<string> {
-  const c = getClient()
-  return await c.graphAddEdge(from, rel, to)
+  return await withClient(async (client) => client.graphAddEdge(from, rel, to))
 }
 
 export async function graphDelEdge(from: string, rel: string, to: string): Promise<string> {
-  const c = getClient()
-  return await c.graphDelEdge(from, rel, to)
+  return await withClient(async (client) => client.graphDelEdge(from, rel, to))
 }
 
 export async function graphHasEdge(from: string, rel: string, to: string): Promise<boolean> {
-  const c = getClient()
-  const result = await c.graphHasEdge(from, rel, to)
+  const result = await withClient(async (client) => client.graphHasEdge(from, rel, to))
   return result === 1 || result === '1'
 }
 
 // Tag operations (MiniMemory specific)
 export async function tagadd(key: string, ...tags: string[]): Promise<string> {
-  const c = getClient()
-  return await c.tagadd(key, ...tags)
+  return await withClient(async (client) => client.tagadd(key, ...tags))
 }
 
 // List operations for logs
 export async function lpush(key: string, value: string): Promise<number> {
-  const c = getClient()
-  const result = await c.call(['LPUSH', key, value])
+  const result = await withClient(async (client) => client.call(['LPUSH', key, value]))
   return Number(result) || 0
 }
 
 export async function lrange(key: string, start: number, stop: number): Promise<string[]> {
-  const c = getClient()
-  const result = await c.call(['LRANGE', key, String(start), String(stop)])
+  const result = await withClient(async (client) => client.call(['LRANGE', key, String(start), String(stop)]))
   if (Array.isArray(result)) {
     return result.map((r: unknown) => Buffer.isBuffer(r) ? r.toString('utf-8') : String(r))
   }
@@ -205,27 +221,48 @@ export async function lrange(key: string, start: number, stop: number): Promise<
 }
 
 export async function ltrim(key: string, start: number, stop: number): Promise<void> {
-  const c = getClient()
-  await c.call(['LTRIM', key, String(start), String(stop)])
+  await withClient(async (client) => {
+    await client.call(['LTRIM', key, String(start), String(stop)])
+  })
+}
+
+export async function pushJsonList<T>(
+  key: string,
+  value: T,
+  options: { maxLength?: number; ttlMs?: number } = {}
+): Promise<number> {
+  const existing = (await getJson<T[]>(key)) || []
+  const next = [value, ...existing]
+  const normalized =
+    typeof options.maxLength === 'number' && options.maxLength >= 0
+      ? next.slice(0, options.maxLength)
+      : next
+  await setJson(key, normalized, options.ttlMs)
+  return normalized.length
+}
+
+export async function getJsonList<T>(key: string, start = 0, stop = -1): Promise<T[]> {
+  const items = (await getJson<T[]>(key)) || []
+  const normalizedStart = Math.max(0, start)
+  const normalizedStop = stop < 0 ? items.length - 1 : stop
+  if (normalizedStart >= items.length || normalizedStop < normalizedStart) return []
+  return items.slice(normalizedStart, normalizedStop + 1)
 }
 
 // Hash operations
 export async function hset(key: string, field: string, value: string): Promise<number> {
-  const c = getClient()
-  const result = await c.call(['HSET', key, field, value])
+  const result = await withClient(async (client) => client.call(['HSET', key, field, value]))
   return Number(result) || 0
 }
 
 export async function hget(key: string, field: string): Promise<string | null> {
-  const c = getClient()
-  const result = await c.call(['HGET', key, field])
+  const result = await withClient(async (client) => client.call(['HGET', key, field]))
   if (result === null) return null
   return Buffer.isBuffer(result) ? result.toString('utf-8') : String(result)
 }
 
 export async function hgetall(key: string): Promise<Record<string, string>> {
-  const c = getClient()
-  const result = await c.call(['HGETALL', key])
+  const result = await withClient(async (client) => client.call(['HGETALL', key]))
   const obj: Record<string, string> = {}
   if (Array.isArray(result)) {
     for (let i = 0; i + 1 < result.length; i += 2) {
@@ -244,7 +281,6 @@ export async function hgetall(key: string): Promise<Record<string, string>> {
 }
 
 export async function hdel(key: string, field: string): Promise<number> {
-  const c = getClient()
-  const result = await c.call(['HDEL', key, field])
+  const result = await withClient(async (client) => client.call(['HDEL', key, field]))
   return Number(result) || 0
 }
