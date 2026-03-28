@@ -1,20 +1,21 @@
 'use client'
 
 import Link from 'next/link'
-import { useCallback, useEffect, useState } from 'react'
+import { use, useCallback, useEffect, useState } from 'react'
 import { ArrowLeft, RefreshCw } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
-import { RunEvent, RunRecord } from '@/types'
+import { RunEvent, RunRecord, TaskRuntimeView } from '@/types'
 import { formatDuration, formatTimestamp } from '@/lib/utils'
 
 type RunDetailResponse = {
   run: RunRecord
   events: RunEvent[]
+  tasks: TaskRuntimeView[]
 }
 
-export default function RunDetailPage({ params }: { params: { id: string } }) {
-  const runId = params.id
+export default function RunDetailPage({ params }: { params: Promise<{ id: string }> }) {
+  const runId = use(params).id
   const [data, setData] = useState<RunDetailResponse | null>(null)
   const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
@@ -65,6 +66,7 @@ export default function RunDetailPage({ params }: { params: { id: string } }) {
 
   const run = data?.run
   const events = data?.events || []
+  const tasks = data?.tasks || []
 
   return (
     <div className="p-8 space-y-6">
@@ -114,6 +116,54 @@ export default function RunDetailPage({ params }: { params: { id: string } }) {
               <InfoRow label="候选数" value={String(run.candidateCount)} />
               <InfoRow label="重试次数" value={String(run.retryCount)} />
               <InfoRow label="错误" value={run.error || '无'} />
+            </div>
+          )}
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>关联 Task</CardTitle>
+        </CardHeader>
+        <CardContent>
+          {tasks.length === 0 ? (
+            <div className="text-center py-8 text-muted-foreground">当前 Run 暂无关联任务</div>
+          ) : (
+            <div className="space-y-3">
+              {tasks.map((task) => (
+                <div key={task.id} className="rounded-lg border p-4 space-y-3">
+                  <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+                    <div className="min-w-0 space-y-2">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <TaskStatusTag status={task.status} />
+                        <span className="font-medium break-all">{task.title}</span>
+                        {task.kind && (
+                          <span className="text-sm text-muted-foreground">{task.kind}</span>
+                        )}
+                      </div>
+                      {task.description && (
+                        <div className="text-sm text-muted-foreground break-all">{task.description}</div>
+                      )}
+                    </div>
+                    <div className="grid grid-cols-2 gap-x-6 gap-y-2 text-sm md:text-right">
+                      <InfoColumn label="更新时间" value={formatTimestamp(task.updatedAt)} />
+                      <InfoColumn label="队列" value={task.queueName || '未入队'} />
+                      <InfoColumn label="优先级" value={task.priority} />
+                      <InfoColumn label="可认领" value={task.isClaimable ? '是' : '否'} />
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 gap-3 lg:grid-cols-4">
+                    <InfoRow label="Task ID" value={task.id} />
+                    <InfoRow label="Agent" value={task.assignedAgentName || task.assignedAgentId || '无'} />
+                    <InfoRow label="Session" value={task.sessionId || '无'} />
+                    <InfoRow
+                      label="Result"
+                      value={task.result ? `${task.result.status}${task.result.summary ? ` · ${task.result.summary}` : ''}` : '无'}
+                    />
+                  </div>
+                </div>
+              ))}
             </div>
           )}
         </CardContent>
@@ -188,10 +238,37 @@ function EventTag({ type }: { type: RunEvent['type'] }) {
   )
 }
 
+function TaskStatusTag({ status }: { status: TaskRuntimeView['status'] }) {
+  return (
+    <span className={`px-2 py-1 rounded-full text-xs font-medium ${
+      status === 'completed' ? 'bg-green-500/10 text-green-500' :
+      status === 'failed' ? 'bg-red-500/10 text-red-500' :
+      status === 'running' ? 'bg-blue-500/10 text-blue-500' :
+      status === 'queued' ? 'bg-violet-500/10 text-violet-500' :
+      'bg-yellow-500/10 text-yellow-500'
+    }`}>
+      {status === 'completed' ? '完成' :
+       status === 'failed' ? '失败' :
+       status === 'running' ? '执行中' :
+       status === 'queued' ? '排队中' :
+       status === 'cancelled' ? '已取消' : '待处理'}
+    </span>
+  )
+}
+
 function InfoRow({ label, value }: { label: string; value: React.ReactNode }) {
   return (
     <div className="rounded-md bg-muted/40 px-3 py-2">
       <div className="text-muted-foreground text-sm">{label}</div>
+      <div className="font-medium break-all">{value}</div>
+    </div>
+  )
+}
+
+function InfoColumn({ label, value }: { label: string; value: string }) {
+  return (
+    <div>
+      <div className="text-sm text-muted-foreground">{label}</div>
       <div className="font-medium break-all">{value}</div>
     </div>
   )

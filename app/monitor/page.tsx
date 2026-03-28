@@ -1,6 +1,8 @@
 'use client'
 
+import Link from 'next/link'
 import { useCallback, useEffect, useState } from 'react'
+import * as Dialog from '@radix-ui/react-dialog'
 import {
   Activity,
   AlertTriangle,
@@ -13,14 +15,23 @@ import {
   RefreshCw,
   Route,
   Server,
+  X,
   XCircle,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
-import { MonitorData, RunRecord, SessionBindingView, TaskRuntimeView } from '@/types'
+import { MonitorData, RunRecord, SessionBindingView, TaskEvent, TaskLease, TaskRecord, TaskResult, TaskRuntimeView } from '@/types'
 import { formatDuration, formatTimestamp, getStatusBgColor } from '@/lib/utils'
+
+type TaskDetailData = {
+  task: TaskRecord
+  events: TaskEvent[]
+  children: TaskRecord[]
+  lease: TaskLease | null
+  result: TaskResult | null
+}
 
 export default function MonitorPage() {
   const [data, setData] = useState<MonitorData | null>(null)
@@ -31,6 +42,11 @@ export default function MonitorPage() {
   const [taskActionKey, setTaskActionKey] = useState<string | null>(null)
   const [taskActionError, setTaskActionError] = useState<string | null>(null)
   const [taskActionMessage, setTaskActionMessage] = useState<string | null>(null)
+  const [taskQueueFilter, setTaskQueueFilter] = useState('__all__')
+  const [detailTaskId, setDetailTaskId] = useState<string | null>(null)
+  const [taskDetail, setTaskDetail] = useState<TaskDetailData | null>(null)
+  const [taskDetailLoading, setTaskDetailLoading] = useState(false)
+  const [taskDetailError, setTaskDetailError] = useState<string | null>(null)
 
   const fetchData = useCallback(async () => {
     try {
@@ -56,6 +72,24 @@ export default function MonitorPage() {
     }
   }
 
+  const fetchTaskDetail = useCallback(async (taskId: string) => {
+    setTaskDetailLoading(true)
+    setTaskDetailError(null)
+    try {
+      const response = await fetch(`/api/tasks/${taskId}`)
+      const result = await response.json()
+      if (!response.ok || !result.success) {
+        throw new Error(result.error || '加载任务详情失败')
+      }
+      setTaskDetail(result.data)
+    } catch (error) {
+      setTaskDetailError(error instanceof Error ? error.message : String(error))
+      setTaskDetail(null)
+    } finally {
+      setTaskDetailLoading(false)
+    }
+  }, [])
+
   const runTaskAction = useCallback(async (
     actionKey: string,
     request: () => Promise<Response>,
@@ -72,12 +106,15 @@ export default function MonitorPage() {
       }
       setTaskActionMessage(getMessage(result.data))
       await fetchData()
+      if (detailTaskId) {
+        await fetchTaskDetail(detailTaskId)
+      }
     } catch (error) {
       setTaskActionError(error instanceof Error ? error.message : String(error))
     } finally {
       setTaskActionKey(null)
     }
-  }, [fetchData])
+  }, [detailTaskId, fetchData, fetchTaskDetail])
 
   const claimNextTask = useCallback(async (queueName: string) => {
     const holderId = executorId.trim()
@@ -159,6 +196,23 @@ export default function MonitorPage() {
     const interval = setInterval(fetchData, 5000)
     return () => clearInterval(interval)
   }, [fetchData])
+
+  useEffect(() => {
+    if (!detailTaskId) {
+      setTaskDetail(null)
+      setTaskDetailError(null)
+      setTaskDetailLoading(false)
+      return
+    }
+    fetchTaskDetail(detailTaskId)
+  }, [detailTaskId, fetchTaskDetail])
+
+  const visibleTasks = data?.runtime.tasks.filter((task) => {
+    if (taskQueueFilter === '__all__') return true
+    return task.queueName === taskQueueFilter
+  }) || []
+
+  const activeFilterLabel = taskQueueFilter === '__all__' ? '全部队列' : taskQueueFilter
 
   if (loading) {
     return (
@@ -355,6 +409,47 @@ export default function MonitorPage() {
                 </div>
               </div>
 
+              <div className="rounded-lg border bg-muted/40 p-4 space-y-4">
+                <div className="flex flex-col gap-2 xl:flex-row xl:items-center xl:justify-between">
+                  <div>
+                    <div className="font-medium">队列筛选</div>
+                    <div className="text-sm text-muted-foreground">
+                      当前查看 {activeFilterLabel}，共 {visibleTasks.length} 条任务
+                    </div>
+                  </div>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() => setTaskQueueFilter('__all__')}
+                    disabled={taskQueueFilter === '__all__'}
+                  >
+                    清空筛选
+                  </Button>
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  <Button
+                    size="sm"
+                    variant={taskQueueFilter === '__all__' ? 'default' : 'outline'}
+                    onClick={() => setTaskQueueFilter('__all__')}
+                  >
+                    全部队列
+                  </Button>
+                  {data?.runtime.taskQueues.map((queue) => (
+                    <Button
+                      key={queue.queueName}
+                      size="sm"
+                      variant={taskQueueFilter === queue.queueName ? 'default' : 'outline'}
+                      onClick={() => {
+                        setTaskQueueFilter(queue.queueName)
+                        setSelectedQueue(queue.queueName)
+                      }}
+                    >
+                      {queue.queueName} · {queue.depth}
+                    </Button>
+                  ))}
+                </div>
+              </div>
+
               <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-5 gap-4">
                 <MetricBox label="Total" value={String(data?.runtime.summary.totalTasks || 0)} />
                 <MetricBox label="Queued" value={String(data?.runtime.summary.queuedTasks || 0)} accent="text-orange-500" />
@@ -366,7 +461,12 @@ export default function MonitorPage() {
               <div className="grid grid-cols-1 xl:grid-cols-3 gap-4">
                 {data?.runtime.taskQueues.length ? (
                   data.runtime.taskQueues.map((queue) => (
-                    <div key={queue.queueName} className="rounded-lg border bg-muted/40 p-4 space-y-3">
+                    <div
+                      key={queue.queueName}
+                      className={`rounded-lg border bg-muted/40 p-4 space-y-3 ${
+                        taskQueueFilter === queue.queueName ? 'ring-2 ring-primary' : ''
+                      }`}
+                    >
                       <div className="flex items-center justify-between gap-4">
                         <div className="font-medium break-all">{queue.queueName}</div>
                         <span className="rounded-full px-3 py-1 text-xs font-medium bg-background text-muted-foreground">
@@ -379,13 +479,25 @@ export default function MonitorPage() {
                         <MetricBox label="Running" value={String(queue.running)} accent="text-blue-500" />
                       </div>
                       <InfoRow label="更新时间" value={queue.updatedAt ? formatTimestamp(queue.updatedAt) : '暂无'} />
-                      <Button
-                        size="sm"
-                        onClick={() => claimNextTask(queue.queueName)}
-                        disabled={!executorId.trim() || Boolean(taskActionKey)}
-                      >
-                        {taskActionKey === `claim-next:${queue.queueName}` ? '认领中...' : 'claim next'}
-                      </Button>
+                      <div className="flex flex-wrap gap-2">
+                        <Button
+                          size="sm"
+                          variant={taskQueueFilter === queue.queueName ? 'default' : 'outline'}
+                          onClick={() => {
+                            setTaskQueueFilter(queue.queueName)
+                            setSelectedQueue(queue.queueName)
+                          }}
+                        >
+                          筛选队列
+                        </Button>
+                        <Button
+                          size="sm"
+                          onClick={() => claimNextTask(queue.queueName)}
+                          disabled={!executorId.trim() || Boolean(taskActionKey)}
+                        >
+                          {taskActionKey === `claim-next:${queue.queueName}` ? '认领中...' : 'claim next'}
+                        </Button>
+                      </div>
                     </div>
                   ))
                 ) : (
@@ -395,17 +507,18 @@ export default function MonitorPage() {
                 )}
               </div>
 
-              {data?.runtime.tasks.length === 0 ? (
+              {visibleTasks.length === 0 ? (
                 <div className="text-center py-8 text-muted-foreground">
-                  暂无任务数据
+                  当前筛选下暂无任务数据
                 </div>
               ) : (
                 <div className="space-y-4">
-                  {data?.runtime.tasks.map((task) => (
+                  {visibleTasks.map((task) => (
                     <TaskItem
                       key={task.id}
                       task={task}
                       actionKey={taskActionKey}
+                      onOpenDetail={() => setDetailTaskId(task.id)}
                       onRelease={releaseTask}
                       onComplete={completeTask}
                       onFail={failTask}
@@ -545,6 +658,155 @@ export default function MonitorPage() {
           </Card>
         </TabsContent>
       </Tabs>
+
+      <Dialog.Root open={Boolean(detailTaskId)} onOpenChange={(open) => !open && setDetailTaskId(null)}>
+        <Dialog.Portal>
+          <Dialog.Overlay className="fixed inset-0 z-50 bg-black/40" />
+          <Dialog.Content className="fixed inset-y-0 right-0 z-50 h-full w-full max-w-3xl overflow-y-auto border-l bg-background shadow-xl">
+            <div className="flex items-center justify-between border-b px-6 py-4">
+              <div>
+                <Dialog.Title className="text-lg font-semibold">任务详情</Dialog.Title>
+                <Dialog.Description className="text-sm text-muted-foreground">
+                  查看任务主记录、事件流、子任务、租约与结果
+                </Dialog.Description>
+              </div>
+              <Dialog.Close asChild>
+                <Button variant="ghost" size="icon">
+                  <X className="h-4 w-4" />
+                </Button>
+              </Dialog.Close>
+            </div>
+
+            <div className="space-y-6 p-6">
+              {taskDetailLoading ? (
+                <div className="flex items-center gap-2 text-muted-foreground">
+                  <RefreshCw className="h-4 w-4 animate-spin" />
+                  加载任务详情中...
+                </div>
+              ) : taskDetailError ? (
+                <div className="rounded-md bg-red-500/10 px-3 py-2 text-sm text-red-500">
+                  {taskDetailError}
+                </div>
+              ) : taskDetail ? (
+                <>
+                  <div className="rounded-lg border p-4 space-y-4">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <TaskStatusTag status={taskDetail.task.status} />
+                      <div className="font-medium break-all">{taskDetail.task.title}</div>
+                      {taskDetail.task.kind && (
+                        <span className="text-sm text-muted-foreground">{taskDetail.task.kind}</span>
+                      )}
+                    </div>
+                    <div className="grid grid-cols-1 xl:grid-cols-2 gap-3">
+                      <InfoRow label="Task ID" value={taskDetail.task.id} />
+                      <InfoRow label="Root Task" value={taskDetail.task.rootTaskId || taskDetail.task.id} />
+                      <InfoRow label="Parent Task" value={taskDetail.task.parentTaskId || '无'} />
+                      <InfoRow label="Queue" value={taskDetail.task.queueName || '未入队'} />
+                      <InfoRow label="Agent" value={taskDetail.task.assignedAgentName || taskDetail.task.assignedAgentId || '无'} />
+                      <InfoRow label="Requested Agent" value={taskDetail.task.requestedAgentId || '无'} />
+                      <InfoRow label="Run ID" value={taskDetail.task.runId || '无'} />
+                      <InfoRow label="Session" value={taskDetail.task.sessionId || '无'} />
+                    </div>
+                    {taskDetail.task.runId && (
+                      <div className="flex justify-start">
+                        <Button asChild variant="outline" size="sm">
+                          <Link href={`/runs/${encodeURIComponent(taskDetail.task.runId)}`}>
+                            查看关联 Run
+                          </Link>
+                        </Button>
+                      </div>
+                    )}
+                    <div className="grid grid-cols-1 xl:grid-cols-3 gap-3">
+                      <InfoRow label="创建时间" value={formatTimestamp(taskDetail.task.createdAt)} />
+                      <InfoRow label="更新时间" value={formatTimestamp(taskDetail.task.updatedAt)} />
+                      <InfoRow label="完成时间" value={taskDetail.task.completedAt ? formatTimestamp(taskDetail.task.completedAt) : '暂无'} />
+                    </div>
+                    {(taskDetail.lease || taskDetail.result || taskDetail.task.error) && (
+                      <div className="grid grid-cols-1 xl:grid-cols-3 gap-3">
+                        <InfoRow
+                          label="Lease"
+                          value={taskDetail.lease ? `${taskDetail.lease.holderId} · ${formatTimestamp(taskDetail.lease.expiresAt)}` : '无'}
+                        />
+                        <InfoRow
+                          label="Result"
+                          value={taskDetail.result ? `${taskDetail.result.status}${taskDetail.result.summary ? ` · ${taskDetail.result.summary}` : ''}` : '无'}
+                        />
+                        <InfoRow label="错误" value={taskDetail.task.error || '无'} />
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="rounded-lg border p-4 space-y-4">
+                    <div className="font-medium">事件流</div>
+                    {taskDetail.events.length === 0 ? (
+                      <div className="text-sm text-muted-foreground">暂无事件</div>
+                    ) : (
+                      <div className="space-y-3">
+                        {taskDetail.events
+                          .slice()
+                          .sort((a, b) => b.timestamp - a.timestamp)
+                          .map((event, index) => (
+                            <div key={`${event.timestamp}-${event.type}-${index}`} className="rounded-md bg-muted/40 p-3 space-y-2">
+                              <div className="flex flex-col gap-1 xl:flex-row xl:items-center xl:justify-between">
+                                <div className="flex items-center gap-2 flex-wrap">
+                                  <span className="rounded-full bg-background px-2 py-1 text-xs font-medium">
+                                    {event.type}
+                                  </span>
+                                  <span className="text-sm">{event.detail || '无详情'}</span>
+                                </div>
+                                <div className="text-xs text-muted-foreground">
+                                  {formatTimestamp(event.timestamp)}
+                                </div>
+                              </div>
+                              {(event.actorId || event.actorType) && (
+                                <div className="text-sm text-muted-foreground">
+                                  Actor {event.actorType || 'unknown'} · {event.actorId || 'unknown'}
+                                </div>
+                              )}
+                              {event.metadata && (
+                                <pre className="overflow-x-auto rounded-md bg-background p-3 text-xs">
+                                  {JSON.stringify(event.metadata, null, 2)}
+                                </pre>
+                              )}
+                            </div>
+                          ))}
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="rounded-lg border p-4 space-y-4">
+                    <div className="font-medium">子任务</div>
+                    {taskDetail.children.length === 0 ? (
+                      <div className="text-sm text-muted-foreground">暂无子任务</div>
+                    ) : (
+                      <div className="space-y-3">
+                        {taskDetail.children.map((child) => (
+                          <div key={child.id} className="rounded-md bg-muted/40 p-3">
+                            <div className="flex items-center gap-2 flex-wrap">
+                              <TaskStatusTag status={child.status} />
+                              <div className="font-medium break-all">{child.title}</div>
+                              {child.kind && (
+                                <span className="text-sm text-muted-foreground">{child.kind}</span>
+                              )}
+                            </div>
+                            <div className="mt-2 grid grid-cols-1 xl:grid-cols-3 gap-3 text-sm">
+                              <InfoRow label="Task ID" value={child.id} />
+                              <InfoRow label="Queue" value={child.queueName || '未入队'} />
+                              <InfoRow label="更新时间" value={formatTimestamp(child.updatedAt)} />
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </>
+              ) : (
+                <div className="text-sm text-muted-foreground">请选择任务查看详情</div>
+              )}
+            </div>
+          </Dialog.Content>
+        </Dialog.Portal>
+      </Dialog.Root>
     </div>
   )
 }
@@ -702,12 +964,14 @@ function SessionItem({ session }: { session: SessionBindingView }) {
 function TaskItem({
   task,
   actionKey,
+  onOpenDetail,
   onRelease,
   onComplete,
   onFail,
 }: {
   task: TaskRuntimeView
   actionKey: string | null
+  onOpenDetail: () => void
   onRelease: (task: TaskRuntimeView) => Promise<void>
   onComplete: (task: TaskRuntimeView, summary: string) => Promise<void>
   onFail: (task: TaskRuntimeView, summary: string) => Promise<void>
@@ -780,6 +1044,14 @@ function TaskItem({
           placeholder="填写完成/失败摘要，留空则自动生成"
         />
         <div className="flex flex-wrap gap-2">
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={onOpenDetail}
+            disabled={Boolean(actionKey)}
+          >
+            详情
+          </Button>
           <Button
             size="sm"
             variant="outline"

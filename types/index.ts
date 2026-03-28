@@ -97,6 +97,27 @@ export interface AgentProfile {
   metadata?: Record<string, unknown>
 }
 
+export type OpenSourceCapabilitySourceType = 'agency-agent' | 'cli-anything'
+
+export interface OpenSourceCapabilityCatalogItem {
+  sourceType: OpenSourceCapabilitySourceType
+  slug: string
+  title: string
+  description?: string
+  category: string
+  repoUrl?: string
+  homepage?: string
+  docsPath?: string
+  capabilities: string[]
+  tools: string[]
+  promptExcerpt?: string
+  metadata?: Record<string, unknown>
+}
+
+export interface AgentImportedCapabilitySource extends OpenSourceCapabilityCatalogItem {
+  importedAt: number
+}
+
 export type RunStatus = 'received' | 'routed' | 'running' | 'completed' | 'failed'
 
 export type RunEventType = 'received' | 'parsed' | 'routed' | 'retry' | 'completed' | 'failed'

@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { Activity, AlertTriangle, Bot, Plus, RefreshCw, Trash2, Edit, Link2, Wrench } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
@@ -15,7 +15,13 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
-import { AgentProfile, AgentRuntimeStats, LlamaService } from '@/types'
+import {
+  AgentImportedCapabilitySource,
+  AgentProfile,
+  AgentRuntimeStats,
+  LlamaService,
+  OpenSourceCapabilityCatalogItem,
+} from '@/types'
 import { cn, formatTimestamp, getStatusBgColor } from '@/lib/utils'
 
 type AgentFormState = {
@@ -29,11 +35,21 @@ type AgentFormState = {
   capabilities: string
   tools: string
   serviceIds: string[]
+  importedSources: AgentImportedCapabilitySource[]
 }
 
 type AgentRuntimeResponse = {
   items: AgentRuntimeStats[]
   total: number
+}
+
+type CapabilityCatalogResponse = {
+  items: OpenSourceCapabilityCatalogItem[]
+  total: number
+  summary: {
+    agencyAgents: number
+    cliAnything: number
+  }
 }
 
 const initialFormState: AgentFormState = {
@@ -47,28 +63,35 @@ const initialFormState: AgentFormState = {
   capabilities: '',
   tools: '',
   serviceIds: [],
+  importedSources: [],
 }
 
 export default function AgentsPage() {
   const [agents, setAgents] = useState<AgentProfile[]>([])
   const [agentRuntimeStats, setAgentRuntimeStats] = useState<Record<string, AgentRuntimeStats>>({})
   const [services, setServices] = useState<LlamaService[]>([])
+  const [capabilityCatalog, setCapabilityCatalog] = useState<OpenSourceCapabilityCatalogItem[]>([])
   const [loading, setLoading] = useState(true)
   const [showForm, setShowForm] = useState(false)
   const [editingAgent, setEditingAgent] = useState<AgentProfile | null>(null)
   const [formData, setFormData] = useState<AgentFormState>(initialFormState)
+  const [catalogLoading, setCatalogLoading] = useState(false)
+  const [catalogQuery, setCatalogQuery] = useState('')
+  const [catalogSourceFilter, setCatalogSourceFilter] = useState<'all' | 'agency-agent' | 'cli-anything'>('all')
 
   const fetchData = async () => {
     try {
-      const [agentsResponse, servicesResponse, runtimeResponse] = await Promise.all([
+      const [agentsResponse, servicesResponse, runtimeResponse, catalogResponse] = await Promise.all([
         fetch('/api/agents'),
         fetch('/api/services'),
         fetch('/api/runtime/agents'),
+        fetch('/api/agent-capability-sources'),
       ])
-      const [agentsResult, servicesResult, runtimeResult] = await Promise.all([
+      const [agentsResult, servicesResult, runtimeResult, catalogResult] = await Promise.all([
         agentsResponse.json(),
         servicesResponse.json(),
         runtimeResponse.json(),
+        catalogResponse.json(),
       ])
 
       if (agentsResult.success) {
@@ -86,10 +109,16 @@ export default function AgentsPage() {
         )
         setAgentRuntimeStats(nextStats)
       }
+
+      if (catalogResult.success) {
+        const catalogData = catalogResult.data as CapabilityCatalogResponse
+        setCapabilityCatalog(catalogData.items || [])
+      }
     } catch (error) {
       console.error('Failed to fetch agent registry data:', error)
     } finally {
       setLoading(false)
+      setCatalogLoading(false)
     }
   }
 
@@ -111,6 +140,7 @@ export default function AgentsPage() {
       serviceIds: formData.serviceIds,
       capabilities: formData.capabilities.split(',').map(item => item.trim()).filter(Boolean),
       tools: formData.tools.split(',').map(item => item.trim()).filter(Boolean),
+      metadata: buildAgentMetadata(editingAgent?.metadata, formData.importedSources),
     }
 
     try {
@@ -150,6 +180,7 @@ export default function AgentsPage() {
       capabilities: agent.capabilities.join(', '),
       tools: agent.tools.join(', '),
       serviceIds: agent.serviceIds,
+      importedSources: getImportedSources(agent.metadata),
     })
     setShowForm(true)
   }
@@ -191,7 +222,63 @@ export default function AgentsPage() {
     }))
   }
 
+  const importCapabilitySource = (source: OpenSourceCapabilityCatalogItem) => {
+    setFormData((current) => {
+      if (current.importedSources.some((item) => item.sourceType === source.sourceType && item.slug === source.slug)) {
+        return current
+      }
+
+      const importedSource: AgentImportedCapabilitySource = {
+        ...source,
+        importedAt: Date.now(),
+      }
+
+      return {
+        ...current,
+        name: current.name || source.title,
+        description: current.description || source.description || '',
+        role: current.role || source.category,
+        systemPrompt: current.systemPrompt || source.promptExcerpt || '',
+        capabilities: mergeTagCsv(current.capabilities, source.capabilities),
+        tools: mergeTagCsv(current.tools, source.tools),
+        importedSources: [...current.importedSources, importedSource],
+      }
+    })
+  }
+
+  const removeImportedSource = (source: AgentImportedCapabilitySource) => {
+    setFormData((current) => ({
+      ...current,
+      importedSources: current.importedSources.filter(
+        (item) => !(item.sourceType === source.sourceType && item.slug === source.slug)
+      ),
+    }))
+  }
+
+  const filteredCatalog = useMemo(() => {
+    const normalizedQuery = catalogQuery.trim().toLowerCase()
+    return capabilityCatalog.filter((item) => {
+      if (catalogSourceFilter !== 'all' && item.sourceType !== catalogSourceFilter) {
+        return false
+      }
+      if (!normalizedQuery) return true
+      const haystack = [
+        item.title,
+        item.description,
+        item.category,
+        item.slug,
+        item.capabilities.join(' '),
+        item.tools.join(' '),
+      ]
+        .filter(Boolean)
+        .join(' ')
+        .toLowerCase()
+      return haystack.includes(normalizedQuery)
+    })
+  }, [capabilityCatalog, catalogQuery, catalogSourceFilter])
+
   useEffect(() => {
+    setCatalogLoading(true)
     fetchData()
   }, [])
 
@@ -311,6 +398,113 @@ export default function AgentsPage() {
                 />
               </div>
 
+              <div className="space-y-4 rounded-lg border p-4">
+                <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
+                  <div>
+                    <p className="font-medium">开源能力库</p>
+                    <p className="text-sm text-muted-foreground">
+                      从 agency-agents 导入 Agent Persona，从 CLI-Anything 导入 CLI 集成能力
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                    <span>{capabilityCatalog.length} 个可导入条目</span>
+                    {catalogLoading && <RefreshCw className="h-4 w-4 animate-spin" />}
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 gap-3 md:grid-cols-[minmax(0,1fr)_180px]">
+                  <Input
+                    value={catalogQuery}
+                    onChange={(e) => setCatalogQuery(e.target.value)}
+                    placeholder="搜索名称、分类、能力或工具"
+                  />
+                  <Select
+                    value={catalogSourceFilter}
+                    onValueChange={(value: 'all' | 'agency-agent' | 'cli-anything') => setCatalogSourceFilter(value)}
+                  >
+                    <SelectTrigger>
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="all">全部来源</SelectItem>
+                      <SelectItem value="agency-agent">agency-agents</SelectItem>
+                      <SelectItem value="cli-anything">CLI-Anything</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+
+                {formData.importedSources.length > 0 && (
+                  <div className="space-y-2">
+                    <p className="text-sm font-medium">已导入来源</p>
+                    <div className="flex flex-wrap gap-2">
+                      {formData.importedSources.map((source) => (
+                        <button
+                          key={`${source.sourceType}-${source.slug}`}
+                          type="button"
+                          onClick={() => removeImportedSource(source)}
+                          className="inline-flex items-center gap-2 rounded-full border px-3 py-1 text-xs hover:bg-accent"
+                        >
+                          <span>{source.title}</span>
+                          <span className="text-muted-foreground">{source.sourceType}</span>
+                          <Trash2 className="h-3.5 w-3.5" />
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                <div className="grid gap-3 lg:grid-cols-2">
+                  {filteredCatalog.slice(0, 12).map((source) => {
+                    const imported = formData.importedSources.some(
+                      (item) => item.sourceType === source.sourceType && item.slug === source.slug
+                    )
+                    return (
+                      <div key={`${source.sourceType}-${source.slug}`} className="rounded-lg border p-4 space-y-3">
+                        <div className="flex items-start justify-between gap-3">
+                          <div className="min-w-0">
+                            <div className="font-medium break-all">{source.title}</div>
+                            <div className="text-sm text-muted-foreground">
+                              {source.sourceType} · {source.category}
+                            </div>
+                          </div>
+                          <Button
+                            type="button"
+                            variant={imported ? 'secondary' : 'outline'}
+                            size="sm"
+                            onClick={() => importCapabilitySource(source)}
+                            disabled={imported}
+                          >
+                            {imported ? '已导入' : '导入'}
+                          </Button>
+                        </div>
+                        <p className="text-sm text-muted-foreground">
+                          {source.description || '暂无描述'}
+                        </p>
+                        {source.capabilities.length > 0 && (
+                          <div className="flex flex-wrap gap-2">
+                            {source.capabilities.slice(0, 4).map((capability) => (
+                              <span key={capability} className="rounded-full bg-secondary px-2.5 py-1 text-xs">
+                                {capability}
+                              </span>
+                            ))}
+                          </div>
+                        )}
+                        {source.tools.length > 0 && (
+                          <div className="text-xs text-muted-foreground">
+                            工具: {source.tools.slice(0, 4).join(', ')}
+                          </div>
+                        )}
+                      </div>
+                    )
+                  })}
+                </div>
+                {filteredCatalog.length > 12 && (
+                  <div className="text-xs text-muted-foreground">
+                    已显示前 12 个结果，可继续缩小搜索范围。
+                  </div>
+                )}
+              </div>
+
               <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
                 <div className="space-y-2">
                   <Label htmlFor="capabilities">能力标签</Label>
@@ -390,6 +584,7 @@ export default function AgentsPage() {
         {agents.map(agent => {
           const mappedServices = services.filter(service => agent.serviceIds.includes(service.id))
           const runtime = agentRuntimeStats[agent.id]
+          const importedSources = getImportedSources(agent.metadata)
           return (
             <Card key={agent.id}>
               <CardHeader>
@@ -441,6 +636,40 @@ export default function AgentsPage() {
                 <div className="grid gap-3 md:grid-cols-4">
                   <div className="rounded-lg border p-3">
                     <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                      <Link2 className="h-4 w-4" />
+                      开源来源
+                    </div>
+                    <div className="mt-2 text-2xl font-semibold">{importedSources.length}</div>
+                  </div>
+                  <div className="rounded-lg border p-3">
+                    <div className="text-sm text-muted-foreground">
+                      agency-agents
+                    </div>
+                    <div className="mt-2 text-2xl font-semibold">
+                      {importedSources.filter((item) => item.sourceType === 'agency-agent').length}
+                    </div>
+                  </div>
+                  <div className="rounded-lg border p-3">
+                    <div className="text-sm text-muted-foreground">
+                      CLI-Anything
+                    </div>
+                    <div className="mt-2 text-2xl font-semibold">
+                      {importedSources.filter((item) => item.sourceType === 'cli-anything').length}
+                    </div>
+                  </div>
+                  <div className="rounded-lg border p-3">
+                    <div className="text-sm text-muted-foreground">
+                      优先服务
+                    </div>
+                    <div className="mt-2 text-2xl font-semibold">
+                      {agent.preferredServiceId ? '已设定' : '自动'}
+                    </div>
+                  </div>
+                </div>
+
+                <div className="grid gap-3 md:grid-cols-4">
+                  <div className="rounded-lg border p-3">
+                    <div className="flex items-center gap-2 text-sm text-muted-foreground">
                       <Activity className="h-4 w-4" />
                       活跃 Run
                     </div>
@@ -480,6 +709,32 @@ export default function AgentsPage() {
                           <span className={cn('h-2 w-2 rounded-full', getStatusBgColor(service.status))} />
                           {service.name}
                         </span>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {importedSources.length > 0 && (
+                  <div className="space-y-2">
+                    <p className="text-sm font-medium">开源能力来源</p>
+                    <div className="space-y-2">
+                      {importedSources.map((source) => (
+                        <div key={`${source.sourceType}-${source.slug}`} className="rounded-lg border p-3">
+                          <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
+                            <div>
+                              <div className="font-medium">{source.title}</div>
+                              <div className="text-sm text-muted-foreground">
+                                {source.sourceType} · {source.category}
+                              </div>
+                            </div>
+                            <div className="text-xs text-muted-foreground">
+                              导入于 {formatTimestamp(source.importedAt)}
+                            </div>
+                          </div>
+                          {source.description && (
+                            <p className="mt-2 text-sm text-muted-foreground">{source.description}</p>
+                          )}
+                        </div>
                       ))}
                     </div>
                   </div>
@@ -557,4 +812,54 @@ export default function AgentsPage() {
       )}
     </div>
   )
+}
+
+function getImportedSources(metadata: AgentProfile['metadata']): AgentImportedCapabilitySource[] {
+  if (!metadata || typeof metadata !== 'object') return []
+  const openSource = (metadata as Record<string, unknown>).openSource
+  if (!openSource || typeof openSource !== 'object') return []
+  const sources = (openSource as Record<string, unknown>).sources
+  if (!Array.isArray(sources)) return []
+
+  return sources.filter((item): item is AgentImportedCapabilitySource => {
+    if (!item || typeof item !== 'object') return false
+    const source = item as Record<string, unknown>
+    return (
+      typeof source.sourceType === 'string' &&
+      typeof source.slug === 'string' &&
+      typeof source.title === 'string' &&
+      typeof source.category === 'string' &&
+      typeof source.importedAt === 'number'
+    )
+  })
+}
+
+function buildAgentMetadata(
+  existingMetadata: AgentProfile['metadata'],
+  importedSources: AgentImportedCapabilitySource[]
+): Record<string, unknown> | undefined {
+  const baseMetadata =
+    existingMetadata && typeof existingMetadata === 'object'
+      ? { ...existingMetadata }
+      : {}
+
+  if (importedSources.length === 0) {
+    delete (baseMetadata as Record<string, unknown>).openSource
+    return Object.keys(baseMetadata).length > 0 ? baseMetadata : undefined
+  }
+
+  return {
+    ...baseMetadata,
+    openSource: {
+      sources: importedSources,
+    },
+  }
+}
+
+function mergeTagCsv(currentValue: string, additions: string[]): string {
+  const merged = Array.from(new Set([
+    ...currentValue.split(',').map((item) => item.trim()).filter(Boolean),
+    ...additions.map((item) => item.trim()).filter(Boolean),
+  ]))
+  return merged.join(', ')
 }
