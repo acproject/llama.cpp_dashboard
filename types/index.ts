@@ -153,10 +153,121 @@ export interface ServiceRuntimeStats {
   lastErrorAt?: number
 }
 
+export interface AgentRuntimeStats {
+  agentId: string
+  agentName: string
+  role?: string
+  activeRuns: number
+  totalRuns: number
+  failedRuns: number
+  successRate: number
+  lastRunAt?: number
+  lastErrorAt?: number
+}
+
+export type TaskStatus = 'pending' | 'queued' | 'running' | 'completed' | 'failed' | 'cancelled'
+
+export type TaskPriority = 'low' | 'normal' | 'high' | 'urgent'
+
+export type TaskEventType =
+  | 'created'
+  | 'updated'
+  | 'status_changed'
+  | 'child_added'
+  | 'leased'
+  | 'lease_released'
+  | 'result_set'
+  | 'completed'
+  | 'failed'
+  | 'cancelled'
+
+export interface TaskRecord {
+  id: string
+  title: string
+  description?: string
+  kind?: string
+  status: TaskStatus
+  priority: TaskPriority
+  parentTaskId?: string
+  rootTaskId?: string
+  queueName?: string
+  runId?: string
+  sessionId?: string
+  requestedAgentId?: string
+  assignedAgentId?: string
+  assignedAgentName?: string
+  retryCount: number
+  maxRetries: number
+  dependsOnTaskIds: string[]
+  childrenCount: number
+  payload?: Record<string, unknown>
+  metadata?: Record<string, unknown>
+  error?: string
+  createdAt: number
+  updatedAt: number
+  claimedAt?: number
+  startedAt?: number
+  completedAt?: number
+}
+
+export interface TaskEvent {
+  taskId: string
+  type: TaskEventType
+  timestamp: number
+  detail?: string
+  actorId?: string
+  actorType?: string
+  metadata?: Record<string, unknown>
+}
+
+export interface TaskLease {
+  taskId: string
+  holderId: string
+  holderType: 'agent' | 'worker' | 'system'
+  acquiredAt: number
+  heartbeatAt: number
+  expiresAt: number
+  metadata?: Record<string, unknown>
+}
+
+export interface TaskResult {
+  taskId: string
+  status: 'success' | 'error' | 'partial'
+  summary?: string
+  output?: unknown
+  metadata?: Record<string, unknown>
+  updatedAt: number
+}
+
+export interface TaskQueueStats {
+  queueName: string
+  depth: number
+  claimable: number
+  running: number
+  updatedAt?: number
+}
+
+export interface TaskRuntimeView extends TaskRecord {
+  lease: TaskLease | null
+  result: TaskResult | null
+  queueDepth: number
+  isClaimable: boolean
+}
+
+export interface TaskClaimResult {
+  task: TaskRecord
+  lease: TaskLease
+}
+
 export interface RuntimeSummary {
   recentRuns: number
   activeRequests: number
+  activeAgents: number
   activeSessions: number
+  activeTasks: number
+  queuedTasks: number
+  totalTasks: number
+  leasedTasks: number
   totalRuntimeRequests: number
   failedRuntimeRequests: number
 }
@@ -183,6 +294,9 @@ export interface MonitorData {
     runs: RunRecord[]
     sessions: SessionBindingView[]
     serviceStats: Record<string, ServiceRuntimeStats>
+    agentStats: Record<string, AgentRuntimeStats>
+    tasks: TaskRuntimeView[]
+    taskQueues: TaskQueueStats[]
     summary: RuntimeSummary
   }
 }

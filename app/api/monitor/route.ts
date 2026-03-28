@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import {
+  AgentRuntimeStats,
   ServiceMetrics,
   HealthCheckResult,
   LlamaService,
@@ -12,6 +13,8 @@ import {
 import { getJson, getJsonList, getNumber, setJson, KEYS } from '@/lib/minimemory'
 import { checkAllServices } from '@/lib/health-check'
 import { keys } from '@/lib/minimemory'
+import { getAgentRuntimeStats, listAgents } from '@/lib/agents'
+import { getTaskRuntimeSnapshot } from '@/lib/tasks'
 
 const ACTIVE_RUN_STALE_MS = 5 * 60 * 1000
 
@@ -117,6 +120,7 @@ async function listServices(): Promise<LlamaService[]> {
 
 async function getRuntimeData(services: LlamaService[]): Promise<MonitorData['runtime']> {
   const now = Date.now()
+  const agents = await listAgents()
   const recentRunIds = await getJsonList<string>(KEYS.RUNS_RECENT, 0, 29)
   const recentRunsRaw = await Promise.all(
     recentRunIds.map(runId => getJson<RunRecord>(KEYS.RUN(runId)))
@@ -184,10 +188,20 @@ async function getRuntimeData(services: LlamaService[]): Promise<MonitorData['ru
   )
 
   const serviceStats = Object.fromEntries(serviceStatsEntries)
+  const agentStats: Record<string, AgentRuntimeStats> = await getAgentRuntimeStats(agents, {
+    activeRunStaleMs: ACTIVE_RUN_STALE_MS,
+    runSampleSize: 30,
+  })
+  const taskSnapshot = await getTaskRuntimeSnapshot({ limit: 30 })
   const runtimeSummary: RuntimeSummary = {
     recentRuns: runs.length,
     activeRequests: Object.values(serviceStats).reduce((sum, item) => sum + item.activeRequests, 0),
+    activeAgents: Object.values(agentStats).filter((item) => item.activeRuns > 0).length,
     activeSessions: sessions.filter(session => Boolean(session.currentRunId)).length,
+    activeTasks: taskSnapshot.summary.running,
+    queuedTasks: taskSnapshot.summary.queued,
+    totalTasks: taskSnapshot.summary.total,
+    leasedTasks: taskSnapshot.summary.leased,
     totalRuntimeRequests: Object.values(serviceStats).reduce((sum, item) => sum + item.totalRequests, 0),
     failedRuntimeRequests: Object.values(serviceStats).reduce((sum, item) => sum + item.failedRequests, 0),
   }
@@ -196,6 +210,9 @@ async function getRuntimeData(services: LlamaService[]): Promise<MonitorData['ru
     runs,
     sessions,
     serviceStats,
+    agentStats,
+    tasks: taskSnapshot.items,
+    taskQueues: taskSnapshot.queues,
     summary: runtimeSummary,
   }
 }

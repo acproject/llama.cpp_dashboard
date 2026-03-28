@@ -1,7 +1,7 @@
 'use client'
 
 import { useEffect, useState } from 'react'
-import { Bot, Plus, RefreshCw, Trash2, Edit, Link2, Wrench } from 'lucide-react'
+import { Activity, AlertTriangle, Bot, Plus, RefreshCw, Trash2, Edit, Link2, Wrench } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -15,7 +15,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
-import { AgentProfile, LlamaService } from '@/types'
+import { AgentProfile, AgentRuntimeStats, LlamaService } from '@/types'
 import { cn, formatTimestamp, getStatusBgColor } from '@/lib/utils'
 
 type AgentFormState = {
@@ -29,6 +29,11 @@ type AgentFormState = {
   capabilities: string
   tools: string
   serviceIds: string[]
+}
+
+type AgentRuntimeResponse = {
+  items: AgentRuntimeStats[]
+  total: number
 }
 
 const initialFormState: AgentFormState = {
@@ -46,6 +51,7 @@ const initialFormState: AgentFormState = {
 
 export default function AgentsPage() {
   const [agents, setAgents] = useState<AgentProfile[]>([])
+  const [agentRuntimeStats, setAgentRuntimeStats] = useState<Record<string, AgentRuntimeStats>>({})
   const [services, setServices] = useState<LlamaService[]>([])
   const [loading, setLoading] = useState(true)
   const [showForm, setShowForm] = useState(false)
@@ -54,13 +60,15 @@ export default function AgentsPage() {
 
   const fetchData = async () => {
     try {
-      const [agentsResponse, servicesResponse] = await Promise.all([
+      const [agentsResponse, servicesResponse, runtimeResponse] = await Promise.all([
         fetch('/api/agents'),
         fetch('/api/services'),
+        fetch('/api/runtime/agents'),
       ])
-      const [agentsResult, servicesResult] = await Promise.all([
+      const [agentsResult, servicesResult, runtimeResult] = await Promise.all([
         agentsResponse.json(),
         servicesResponse.json(),
+        runtimeResponse.json(),
       ])
 
       if (agentsResult.success) {
@@ -69,6 +77,14 @@ export default function AgentsPage() {
 
       if (servicesResult.success) {
         setServices(servicesResult.data)
+      }
+
+      if (runtimeResult.success) {
+        const runtimeData = runtimeResult.data as AgentRuntimeResponse
+        const nextStats = Object.fromEntries(
+          (runtimeData.items || []).map((item) => [item.agentId, item])
+        )
+        setAgentRuntimeStats(nextStats)
       }
     } catch (error) {
       console.error('Failed to fetch agent registry data:', error)
@@ -373,6 +389,7 @@ export default function AgentsPage() {
       <div className="grid gap-6 lg:grid-cols-2">
         {agents.map(agent => {
           const mappedServices = services.filter(service => agent.serviceIds.includes(service.id))
+          const runtime = agentRuntimeStats[agent.id]
           return (
             <Card key={agent.id}>
               <CardHeader>
@@ -418,6 +435,36 @@ export default function AgentsPage() {
                       工具标签
                     </div>
                     <div className="mt-2 text-2xl font-semibold">{agent.tools.length}</div>
+                  </div>
+                </div>
+
+                <div className="grid gap-3 md:grid-cols-4">
+                  <div className="rounded-lg border p-3">
+                    <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                      <Activity className="h-4 w-4" />
+                      活跃 Run
+                    </div>
+                    <div className="mt-2 text-2xl font-semibold">{runtime?.activeRuns || 0}</div>
+                  </div>
+                  <div className="rounded-lg border p-3">
+                    <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                      <Bot className="h-4 w-4" />
+                      总 Run
+                    </div>
+                    <div className="mt-2 text-2xl font-semibold">{runtime?.totalRuns || 0}</div>
+                  </div>
+                  <div className="rounded-lg border p-3">
+                    <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                      <AlertTriangle className="h-4 w-4" />
+                      失败 Run
+                    </div>
+                    <div className="mt-2 text-2xl font-semibold">{runtime?.failedRuns || 0}</div>
+                  </div>
+                  <div className="rounded-lg border p-3">
+                    <div className="text-sm text-muted-foreground">
+                      成功率
+                    </div>
+                    <div className="mt-2 text-2xl font-semibold">{runtime ? `${runtime.successRate}%` : '0%'}</div>
                   </div>
                 </div>
 
@@ -467,6 +514,12 @@ export default function AgentsPage() {
                 <div className="text-xs text-muted-foreground">
                   更新于 {formatTimestamp(agent.updatedAt)}
                 </div>
+                {runtime?.lastRunAt && (
+                  <div className="text-xs text-muted-foreground">
+                    最近 Run {formatTimestamp(runtime.lastRunAt)}
+                    {runtime.lastErrorAt ? ` · 最近失败 ${formatTimestamp(runtime.lastErrorAt)}` : ''}
+                  </div>
+                )}
 
                 <div className="flex flex-wrap gap-2">
                   <Button variant="outline" size="sm" onClick={() => handleEdit(agent)}>

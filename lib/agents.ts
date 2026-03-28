@@ -1,7 +1,9 @@
-import { AgentProfile, LlamaService } from '@/types'
+import { AgentProfile, AgentRuntimeStats, LlamaService, RunRecord } from '@/types'
 import {
   deleteKey,
   getJson,
+  getJsonList,
+  getNumber,
   graphAddEdge,
   graphDelEdge,
   KEYS,
@@ -37,6 +39,58 @@ export async function listAgents(): Promise<AgentProfile[]> {
 
 export async function getAgentProfile(id: string): Promise<AgentProfile | null> {
   return await getJson<AgentProfile>(KEYS.AGENT(id))
+}
+
+export async function getAgentRuntimeStats(
+  agents: AgentProfile[],
+  options: { activeRunStaleMs?: number; runSampleSize?: number } = {}
+): Promise<Record<string, AgentRuntimeStats>> {
+  const activeRunStaleMs = options.activeRunStaleMs ?? 5 * 60 * 1000
+  const runSampleSize = options.runSampleSize ?? 20
+  const activeRunStatuses = new Set<RunRecord['status']>(['received', 'routed', 'running'])
+  const now = Date.now()
+
+  const entries = await Promise.all(
+    agents.map(async (agent) => {
+      const [activeRunsRaw, totalRuns, failedRuns, agentRunIds] = await Promise.all([
+        getNumber(KEYS.AGENT_ACTIVE(agent.id)),
+        getNumber(KEYS.AGENT_TOTAL(agent.id)),
+        getNumber(KEYS.AGENT_ERROR(agent.id)),
+        getJsonList<string>(KEYS.RUNS_BY_AGENT(agent.id), 0, Math.max(0, runSampleSize - 1)),
+      ])
+
+      const recentRunsRaw = await Promise.all(
+        agentRunIds.map((runId) => getJson<RunRecord>(KEYS.RUN(runId)))
+      )
+      const recentRuns = recentRunsRaw.filter((run): run is RunRecord => Boolean(run))
+      const activeRuns = recentRuns.reduce((count, run) => {
+        if (!activeRunStatuses.has(run.status)) return count
+        return now - run.startedAt <= activeRunStaleMs ? count + 1 : count
+      }, 0)
+      const lastRun = recentRuns[0]
+      const lastFailedRun = recentRuns.find((run) => run.status === 'failed')
+      const successRate =
+        totalRuns > 0
+          ? Number((((totalRuns - failedRuns) / totalRuns) * 100).toFixed(1))
+          : 0
+
+      const stats: AgentRuntimeStats = {
+        agentId: agent.id,
+        agentName: agent.name,
+        role: agent.role,
+        activeRuns: activeRuns || (activeRunsRaw > 0 ? 0 : activeRunsRaw),
+        totalRuns,
+        failedRuns,
+        successRate,
+        lastRunAt: lastRun?.startedAt,
+        lastErrorAt: lastFailedRun?.completedAt || lastFailedRun?.startedAt,
+      }
+
+      return [agent.id, stats] as const
+    })
+  )
+
+  return Object.fromEntries(entries)
 }
 
 export async function createAgentProfile(input: unknown): Promise<AgentProfile> {

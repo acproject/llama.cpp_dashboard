@@ -32,6 +32,7 @@ export default function RunsPage() {
   const [error, setError] = useState<string | null>(null)
 
   const [status, setStatus] = useState<RunStatus | '__all__'>('__all__')
+  const [agentId, setAgentId] = useState('')
   const [sessionId, setSessionId] = useState('')
   const [serviceId, setServiceId] = useState('')
   const [model, setModel] = useState('')
@@ -40,11 +41,12 @@ export default function RunsPage() {
     const params = new URLSearchParams()
     params.set('limit', '60')
     if (status !== '__all__') params.set('status', status)
+    if (agentId.trim()) params.set('agentId', agentId.trim())
     if (sessionId.trim()) params.set('sessionId', sessionId.trim())
     if (serviceId.trim()) params.set('serviceId', serviceId.trim())
     if (model.trim()) params.set('model', model.trim())
     return params.toString()
-  }, [model, serviceId, sessionId, status])
+  }, [agentId, model, serviceId, sessionId, status])
 
   const fetchRuns = useCallback(async () => {
     setError(null)
@@ -107,7 +109,7 @@ export default function RunsPage() {
         <CardHeader>
           <CardTitle>过滤</CardTitle>
         </CardHeader>
-        <CardContent className="grid grid-cols-1 gap-4 md:grid-cols-4">
+        <CardContent className="grid grid-cols-1 gap-4 md:grid-cols-5">
           <div className="space-y-2">
             <Label>状态</Label>
             <Select value={status} onValueChange={(v) => setStatus(v as any)}>
@@ -122,6 +124,10 @@ export default function RunsPage() {
                 ))}
               </SelectContent>
             </Select>
+          </div>
+          <div className="space-y-2">
+            <Label>AgentId</Label>
+            <Input value={agentId} onChange={(e) => setAgentId(e.target.value)} placeholder="可选" />
           </div>
           <div className="space-y-2">
             <Label>SessionId</Label>
@@ -175,6 +181,11 @@ export default function RunsPage() {
                       <div className="mt-2 text-sm text-muted-foreground break-all">
                         {run.upstreamPath}
                       </div>
+                      {(run.agentName || run.agentId) && (
+                        <div className="mt-2 text-sm text-muted-foreground break-all">
+                          Agent {run.agentName || run.agentId}
+                        </div>
+                      )}
                     </div>
                     <div className="grid grid-cols-2 gap-x-6 gap-y-2 text-sm xl:text-right">
                       <InfoColumn label="开始时间" value={formatTimestamp(run.startedAt)} />
@@ -185,6 +196,7 @@ export default function RunsPage() {
                   </div>
                   <div className="grid grid-cols-1 xl:grid-cols-3 gap-3 text-sm mt-3">
                     <InfoRow label="Run ID" value={run.id} />
+                    <InfoRow label="Agent" value={run.agentName || run.agentId || '无'} />
                     <InfoRow label="Session" value={run.sessionId || '无'} />
                     <InfoRow label="调度模式" value={run.schedulingMode || 'direct'} />
                   </div>

@@ -27,12 +27,22 @@ export const KEYS = {
   AGENTS: 'agent:profiles',
   AGENT: (id: string) => `agent:profile:${id}`,
   AGENT_GRAPH: (id: string) => `agent:graph:${id}`,
+  AGENT_ACTIVE: (id: string) => `agent:runtime:active:${id}`,
+  AGENT_TOTAL: (id: string) => `agent:runtime:total:${id}`,
+  AGENT_ERROR: (id: string) => `agent:runtime:error:${id}`,
   SERVICE_ACTIVE: (id: string) => `agent:service:active:${id}`,
   SERVICE_TOTAL: (id: string) => `agent:service:total:${id}`,
   SERVICE_ERROR: (id: string) => `agent:service:error:${id}`,
   RUNS_RECENT: 'agent:runs:recent',
+  RUNS_BY_AGENT: (agentId: string) => `agent:runs:by-agent:${agentId}`,
   RUNS_BY_SESSION: (sessionId: string) => `agent:runs:by-session:${sessionId}`,
   RUNS_BY_SERVICE: (serviceId: string) => `agent:runs:by-service:${serviceId}`,
+  TASK: (id: string) => `task:${id}`,
+  TASK_EVENTS: (id: string) => `task:event:${id}`,
+  TASK_CHILDREN: (id: string) => `task:children:${id}`,
+  TASK_LEASE: (id: string) => `task:lease:${id}`,
+  TASK_RESULT: (id: string) => `task:result:${id}`,
+  TASK_QUEUE: (queueName: string) => `task:queue:${queueName}`,
 }
 
 export function getClient(): MiniMemoryClient {

@@ -1,7 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { decr, getJson, getNumber, incr, keys, KEYS, pushJsonList, setJson } from '@/lib/minimemory'
-import { AgentProfile, DispatchConfig, LlamaService, RunEventType, RunRecord, SessionRecord } from '@/types'
+import { AgentProfile, DispatchConfig, LlamaService, RunEventType, RunRecord, SessionRecord, TaskPriority } from '@/types'
+import { listAgents } from '@/lib/agents'
 import { getDispatchConfig } from '@/lib/orchestrator'
+import { addTaskChild, appendTaskEvent, createTask, releaseTaskLease, setTaskResult, updateTask, upsertTaskLease } from '@/lib/tasks'
 import { generateId } from '@/lib/utils'
 
 function stableHash(s: string): number {
@@ -55,6 +57,38 @@ function getRequestedAgentId(request: NextRequest, parsedJson: any): string | nu
   }
 
   return null
+}
+
+function getRequestedCapabilities(request: NextRequest, parsedJson: any): string[] {
+  const capabilities = new Set<string>()
+  const candidateArrays = [
+    parsedJson?.requiredCapabilities,
+    parsedJson?.required_capabilities,
+    parsedJson?.metadata?.requiredCapabilities,
+    parsedJson?.metadata?.required_capabilities,
+  ]
+
+  for (const candidate of candidateArrays) {
+    if (!Array.isArray(candidate)) continue
+    for (const item of candidate) {
+      if (typeof item === 'string' && item.trim()) {
+        capabilities.add(item.trim())
+      }
+    }
+  }
+
+  const headerValue = request.headers.get('x-agent-capabilities')
+  if (headerValue) {
+    for (const item of headerValue.split(',')) {
+      if (item.trim()) capabilities.add(item.trim())
+    }
+  }
+
+  if (Array.isArray(parsedJson?.tools) && parsedJson.tools.length > 0) {
+    capabilities.add('tools')
+  }
+
+  return Array.from(capabilities)
 }
 
 function toSessionRouteKey(rawSessionKey: string): string {
@@ -289,6 +323,72 @@ function filterServicesForAgent(services: LlamaService[], agent: AgentProfile | 
   return scoped
 }
 
+function scoreAgentForRequest(
+  agent: AgentProfile,
+  services: LlamaService[],
+  model: string | null,
+  requiredCapabilities: string[]
+): number {
+  if (!agent.enabled) return Number.NEGATIVE_INFINITY
+  const scopedServices = filterServicesForAgent(services, agent)
+  if (scopedServices.length === 0) return Number.NEGATIVE_INFINITY
+
+  if (requiredCapabilities.length > 0) {
+    const capabilityScore = requiredCapabilities.filter(capability => agent.capabilities.includes(capability)).length
+    if (capabilityScore === 0) {
+      const matchedServiceCapabilities = scopedServices.some(service =>
+        requiredCapabilities.some(capability => service.capabilities.includes(capability))
+      )
+      if (!matchedServiceCapabilities) return Number.NEGATIVE_INFINITY
+    }
+  }
+
+  const matchingServices = model
+    ? scopedServices.filter(service => serviceMatchesModel(service, model))
+    : scopedServices
+  if (matchingServices.length === 0) return Number.NEGATIVE_INFINITY
+
+  let score = 0
+  if (model && agent.defaultModel && serviceMatchesModel({ ...matchingServices[0], model: agent.defaultModel } as LlamaService, model)) {
+    score += 60
+  }
+  if (agent.preferredServiceId && matchingServices.some(service => service.id === agent.preferredServiceId)) {
+    score += 40
+  }
+  score += matchingServices.length * 3
+  score += requiredCapabilities.filter(capability => agent.capabilities.includes(capability)).length * 20
+  if (agent.role && agent.role !== 'general') score += 5
+  return score
+}
+
+async function selectAgentForRequest(input: {
+  requestedAgentId: string | null
+  services: LlamaService[]
+  model: string | null
+  requiredCapabilities: string[]
+}): Promise<{ agent: AgentProfile | null; selectionMode: 'requested' | 'auto' | 'none' }> {
+  if (input.requestedAgentId) {
+    return {
+      agent: await getJson<AgentProfile>(KEYS.AGENT(input.requestedAgentId)),
+      selectionMode: 'requested',
+    }
+  }
+
+  const agents = await listAgents()
+  const ranked = agents
+    .map((agent) => ({
+      agent,
+      score: scoreAgentForRequest(agent, input.services, input.model, input.requiredCapabilities),
+    }))
+    .filter((entry) => Number.isFinite(entry.score))
+    .sort((a, b) => b.score - a.score || b.agent.updatedAt - a.agent.updatedAt)
+
+  return {
+    agent: ranked[0]?.agent || null,
+    selectionMode: ranked[0] ? 'auto' : 'none',
+  }
+}
+
 async function handleModels(request: NextRequest) {
   const services = await listServices()
   const requestedAgentId = getRequestedAgentId(request, null)
@@ -311,9 +411,28 @@ function shouldCountServiceError(status: number): boolean {
   return status === 429 || status >= 500
 }
 
-function withRunHeader(response: NextResponse, runId: string): NextResponse {
+function withRunHeader(response: NextResponse, runId: string, taskId?: string): NextResponse {
   response.headers.set('x-orchestrator-run-id', runId)
+  if (taskId) response.headers.set('x-orchestrator-task-id', taskId)
   return response
+}
+
+function getRequestedTaskPriority(request: NextRequest, parsedJson: any): TaskPriority {
+  const candidates = [
+    parsedJson?.taskPriority,
+    parsedJson?.task_priority,
+    parsedJson?.metadata?.taskPriority,
+    parsedJson?.metadata?.task_priority,
+    request.headers.get('x-task-priority'),
+  ]
+
+  for (const candidate of candidates) {
+    if (candidate === 'low' || candidate === 'normal' || candidate === 'high' || candidate === 'urgent') {
+      return candidate
+    }
+  }
+
+  return 'normal'
 }
 
 function toOpenAIErrorPayload(input: {
@@ -534,10 +653,27 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
       : { model: hintedModel, session_id: hintedSessionId }
 
   const requestedAgentId = getRequestedAgentId(request, routingHints)
-  const selectedAgent = requestedAgentId ? await getJson<AgentProfile>(KEYS.AGENT(requestedAgentId)) : null
   let model = typeof routingHints?.model === 'string' ? routingHints.model : null
+  const services = await listServices()
+  const requiredCapabilities = getRequestedCapabilities(request, routingHints)
+  let { agent: selectedAgent, selectionMode: agentSelectionMode } = await selectAgentForRequest({
+    requestedAgentId,
+    services,
+    model,
+    requiredCapabilities,
+  })
   if (!model && selectedAgent?.defaultModel) {
     model = selectedAgent.defaultModel
+    if (!requestedAgentId) {
+      const reselection = await selectAgentForRequest({
+        requestedAgentId,
+        services,
+        model,
+        requiredCapabilities,
+      })
+      selectedAgent = reselection.agent
+      agentSelectionMode = reselection.selectionMode
+    }
   }
   const rawSessionKey = getSessionKey(request, routingHints)
   const sessionRouteKey = rawSessionKey ? toSessionRouteKey(rawSessionKey) : null
@@ -548,7 +684,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
     status: 'received',
     upstreamPath,
     method: request.method,
-    agentId: requestedAgentId || undefined,
+    agentId: selectedAgent?.id || requestedAgentId || undefined,
     agentName: selectedAgent?.name,
     model: model || undefined,
     sessionId: rawSessionKey || undefined,
@@ -559,6 +695,29 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
     retryCount: 0,
     startedAt,
   }
+  const taskPriority = getRequestedTaskPriority(request, routingHints)
+  const rootTask = await createTask({
+    title: model ? `${upstreamPath} · ${model}` : upstreamPath,
+    description: `gateway request ${request.method} ${upstreamPath}`,
+    kind: 'gateway_request',
+    status: 'pending',
+    priority: taskPriority,
+    runId,
+    sessionId: rawSessionKey || undefined,
+    requestedAgentId: requestedAgentId || undefined,
+    assignedAgentId: selectedAgent?.id,
+    assignedAgentName: selectedAgent?.name,
+    payload: {
+      upstreamPath,
+      method: request.method,
+      model: model || null,
+      sessionId: rawSessionKey || null,
+      requestedAgentId: requestedAgentId || null,
+      contentType: contentType || null,
+      stream: parsedJson?.stream === true,
+    },
+  })
+  const taskId = rootTask.id
 
   const writeRun = async (patch: Partial<RunRecord> = {}) => {
     Object.assign(runRecord, patch)
@@ -606,7 +765,46 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
     await setJson(KEYS.SESSION(rawSessionKey), next, RUN_TTL_MS)
   }
 
+  const writeTask = async (patch: Parameters<typeof updateTask>[1]) => {
+    await updateTask(taskId, patch)
+  }
+
+  const pushTaskEvent = async (type: Parameters<typeof appendTaskEvent>[1]['type'], detail: string, metadata?: Record<string, unknown>) => {
+    await appendTaskEvent(taskId, {
+      type,
+      detail,
+      metadata,
+      actorId: selectedAgent?.id || 'gateway',
+      actorType: selectedAgent ? 'agent' : 'system',
+    })
+  }
+
   let runFinalized = false
+  let agentRuntimeStarted = false
+  let agentRuntimeReleased = false
+  let taskLeaseReleased = false
+
+  const startAgentRuntime = async () => {
+    if (!selectedAgent || agentRuntimeStarted) return
+    agentRuntimeStarted = true
+    await Promise.all([
+      incr(KEYS.AGENT_ACTIVE(selectedAgent.id)),
+      incr(KEYS.AGENT_TOTAL(selectedAgent.id)),
+      pushRunIndex(KEYS.RUNS_BY_AGENT(selectedAgent.id)),
+    ])
+  }
+
+  const releaseAgentRuntime = async (failed: boolean) => {
+    if (!selectedAgent || !agentRuntimeStarted || agentRuntimeReleased) return
+    agentRuntimeReleased = true
+    const nextActive = await decr(KEYS.AGENT_ACTIVE(selectedAgent.id))
+    if (nextActive < 0) {
+      await setJson(KEYS.AGENT_ACTIVE(selectedAgent.id), 0)
+    }
+    if (failed) {
+      await incr(KEYS.AGENT_ERROR(selectedAgent.id))
+    }
+  }
 
   const finalizeRun = async (status: 'completed' | 'failed', error?: string) => {
     if (runFinalized) return
@@ -634,12 +832,43 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
       },
     })
 
-    await updateSessionRecord({
-      currentRunId: undefined,
-      lastRunId: runId,
-      lastModel: model || undefined,
-      boundServiceId: runRecord.serviceId,
-    })
+    await Promise.all([
+      releaseAgentRuntime(failed),
+      updateSessionRecord({
+        currentRunId: undefined,
+        lastRunId: runId,
+        lastModel: model || undefined,
+        boundServiceId: runRecord.serviceId,
+      }),
+      setTaskResult(taskId, {
+        status: failed ? 'error' : 'success',
+        summary: error || (failed ? 'gateway request failed' : 'gateway request completed'),
+        output: {
+          runId,
+          upstreamPath,
+          model: model || null,
+          serviceId: runRecord.serviceId || null,
+          serviceName: runRecord.serviceName || null,
+          retryCount: runRecord.retryCount,
+          candidateCount: runRecord.candidateCount,
+          latencyMs: completedAt - startedAt,
+        },
+        metadata: {
+          runId,
+          completedAt,
+          serviceId: runRecord.serviceId || null,
+          serviceName: runRecord.serviceName || null,
+          failed,
+        },
+      }),
+      taskLeaseReleased
+        ? Promise.resolve()
+        : releaseTaskLease(taskId, {
+          holderId: selectedAgent?.id || 'gateway',
+        }).finally(() => {
+          taskLeaseReleased = true
+        }),
+    ])
   }
 
   await writeRun()
@@ -655,6 +884,24 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
       agentId: requestedAgentId || null,
     },
   })
+  await pushTaskEvent('status_changed', 'request parsed into task context', {
+    model: model || null,
+    sessionId: rawSessionKey || null,
+    requestedAgentId: requestedAgentId || null,
+    selectedAgentId: selectedAgent?.id || null,
+    agentSelectionMode,
+    requiredCapabilities,
+  })
+  if (selectedAgent && agentSelectionMode === 'auto' && !requestedAgentId) {
+    await pushRunEvent('parsed', {
+      detail: `auto selected agent ${selectedAgent.name}`,
+      metadata: {
+        selectedAgentId: selectedAgent.id,
+        selectedAgentName: selectedAgent.name,
+        requiredCapabilities,
+      },
+    })
+  }
   await pushRunIndex(KEYS.RUNS_RECENT)
   if (rawSessionKey) {
     await pushRunIndex(KEYS.RUNS_BY_SESSION(rawSessionKey))
@@ -667,6 +914,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
 
   if (requestedAgentId && !selectedAgent) {
     await writeRun({ status: 'failed' })
+    await writeTask({ error: `Agent profile not found: ${requestedAgentId}` })
     await finalizeRun('failed', `Agent profile not found: ${requestedAgentId}`)
     return withRunHeader(NextResponse.json(
       toOpenAIErrorPayload({
@@ -674,11 +922,12 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
         type: 'invalid_request_error',
       }),
       { status: 400 }
-    ), runId)
+    ), runId, taskId)
   }
 
   if (selectedAgent && !selectedAgent.enabled) {
     await writeRun({ status: 'failed' })
+    await writeTask({ error: `Agent profile is disabled: ${selectedAgent.name}` })
     await finalizeRun('failed', `Agent profile is disabled: ${selectedAgent.name}`)
     return withRunHeader(NextResponse.json(
       toOpenAIErrorPayload({
@@ -686,10 +935,26 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
         type: 'invalid_request_error',
       }),
       { status: 400 }
-    ), runId)
+    ), runId, taskId)
   }
 
-  const services = await listServices()
+  await upsertTaskLease(taskId, {
+    holderId: selectedAgent?.id || 'gateway',
+    holderType: selectedAgent ? 'agent' : 'system',
+    ttlMs: 10 * 60 * 1000,
+    metadata: {
+      runId,
+      upstreamPath,
+      requestedAgentId: requestedAgentId || null,
+    },
+  })
+  await writeTask({
+    status: 'queued',
+    assignedAgentId: selectedAgent?.id,
+    assignedAgentName: selectedAgent?.name,
+  })
+  await startAgentRuntime()
+
   const dispatchConfig = await getDispatchConfig()
   const routedServices = filterServicesForAgent(services, selectedAgent)
 
@@ -757,6 +1022,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
   } else {
     if (!selected && requiresModel(upstreamPath)) {
       await writeRun({ status: 'failed' })
+      await writeTask({ error: 'model name is missing from the request' })
       await finalizeRun('failed', 'model name is missing from the request')
       return withRunHeader(NextResponse.json(
         toOpenAIErrorPayload({
@@ -765,7 +1031,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
           param: 'model',
         }),
         { status: 400 }
-      ), runId)
+      ), runId, taskId)
     }
   }
 
@@ -775,6 +1041,10 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
       schedulingMode,
       status: 'failed',
     })
+    await writeTask({
+      retryCount: 0,
+      error: 'No available service for model',
+    })
     await finalizeRun('failed', 'No available service for model')
     return withRunHeader(NextResponse.json(
       toOpenAIErrorPayload({
@@ -783,7 +1053,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
         param: 'model',
       }),
       { status: 400 }
-    ), runId)
+    ), runId, taskId)
   }
 
   await writeRun({
@@ -795,6 +1065,11 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
     schedulingMode,
     candidateCount,
   })
+  await writeTask({
+    status: 'running',
+    assignedAgentId: selectedAgent?.id,
+    assignedAgentName: selectedAgent?.name,
+  })
   await pushRunEvent('routed', {
     serviceId: selected.id,
     serviceName: selected.name,
@@ -805,6 +1080,14 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
       serviceHost: selected.host,
       servicePort: selected.port,
     },
+  })
+  await pushTaskEvent('status_changed', `routed to ${selected.name}`, {
+    serviceId: selected.id,
+    serviceName: selected.name,
+    serviceHost: selected.host,
+    servicePort: selected.port,
+    candidateCount,
+    schedulingMode,
   })
   await pushRunIndex(KEYS.RUNS_BY_SERVICE(selected.id))
 
@@ -832,7 +1115,70 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
       ? JSON.stringify(parsedJson)
       : (rawBuf.length ? rawBuf : undefined)
 
-  const beginServiceAttempt = async (service: LlamaService) => {
+  const finalizeAttemptTask = async (
+    attemptTaskId: string,
+    service: LlamaService,
+    input: {
+      taskFailed?: boolean
+      detail?: string
+      statusCode?: number
+    } = {}
+  ) => {
+    await Promise.all([
+      setTaskResult(attemptTaskId, {
+        status: input.taskFailed ? 'error' : 'success',
+        summary: input.detail || (input.taskFailed ? 'service attempt failed' : 'service attempt completed'),
+        output: {
+          runId,
+          serviceId: service.id,
+          serviceName: service.name,
+          serviceHost: service.host,
+          servicePort: service.port,
+          statusCode: input.statusCode || null,
+        },
+        metadata: {
+          runId,
+          statusCode: input.statusCode || null,
+          taskFailed: Boolean(input.taskFailed),
+        },
+      }),
+      releaseTaskLease(attemptTaskId, { holderId: service.id }),
+    ])
+  }
+
+  const beginServiceAttempt = async (service: LlamaService, reason: string, attempt: number) => {
+    const attemptTask = await addTaskChild(taskId, {
+      title: `${service.name} attempt ${attempt}`,
+      description: `service attempt ${attempt} for ${upstreamPath}`,
+      kind: 'service_attempt',
+      status: 'running',
+      priority: taskPriority,
+      runId,
+      sessionId: rawSessionKey || undefined,
+      requestedAgentId: requestedAgentId || undefined,
+      assignedAgentId: selectedAgent?.id,
+      assignedAgentName: selectedAgent?.name,
+      payload: {
+        serviceId: service.id,
+        serviceName: service.name,
+        serviceHost: service.host,
+        servicePort: service.port,
+        model: model || null,
+        reason,
+        attempt,
+      },
+    })
+    await upsertTaskLease(attemptTask.id, {
+      holderId: service.id,
+      holderType: 'worker',
+      ttlMs: 10 * 60 * 1000,
+      metadata: {
+        runId,
+        reason,
+        attempt,
+      },
+    })
+
     await Promise.all([
       incr(KEYS.SERVICE_ACTIVE(service.id)),
       incr(KEYS.SERVICE_TOTAL(service.id)),
@@ -840,21 +1186,30 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
 
     let released = false
 
-    return async (failed = false) => {
+    return async (input: {
+      countServiceError?: boolean
+      taskFailed?: boolean
+      detail?: string
+      statusCode?: number
+    } = {}) => {
       if (released) return
       released = true
       const nextActive = await decr(KEYS.SERVICE_ACTIVE(service.id))
       if (nextActive < 0) {
         await setJson(KEYS.SERVICE_ACTIVE(service.id), 0)
       }
-      if (failed) {
+      if (input.countServiceError) {
         await incr(KEYS.SERVICE_ERROR(service.id))
       }
+      await finalizeAttemptTask(attemptTask.id, service, input)
     }
   }
 
-  const fetchUpstream = async (service: LlamaService) => {
-    const release = await beginServiceAttempt(service)
+  let nextAttempt = 1
+
+  const fetchUpstream = async (service: LlamaService, reason: string) => {
+    const release = await beginServiceAttempt(service, reason, nextAttempt)
+    nextAttempt += 1
     const serviceUrl = `http://${service.host}:${service.port}${upstreamPath}`
     try {
       const response = await fetch(serviceUrl, {
@@ -864,20 +1219,30 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
       })
       return { response, serviceUrl, release }
     } catch (error) {
-      await release(true)
+      await release({
+        countServiceError: true,
+        taskFailed: true,
+        detail: `Upstream fetch failed: ${String(error)}`,
+      })
       throw error
     }
   }
 
   let upstreamRes: Response
   let selectedUrl = ''
-  let releaseFinalAttempt: null | ((failed?: boolean) => Promise<void>) = null
+  let releaseFinalAttempt: null | ((input?: {
+    countServiceError?: boolean
+    taskFailed?: boolean
+    detail?: string
+    statusCode?: number
+  }) => Promise<void>) = null
   try {
-    const result = await fetchUpstream(selected)
+    const result = await fetchUpstream(selected, 'initial')
     upstreamRes = result.response
     selectedUrl = result.serviceUrl
     releaseFinalAttempt = result.release
   } catch (error) {
+    await writeTask({ error: `Upstream fetch failed: ${String(error)}` })
     await finalizeRun('failed', `Upstream fetch failed: ${String(error)}`)
     return withRunHeader(NextResponse.json(
       toOpenAIErrorPayload({
@@ -885,7 +1250,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
         type: 'server_error',
       }),
       { status: 502 }
-    ), runId)
+    ), runId, taskId)
   }
 
   let retryCount = 0
@@ -894,25 +1259,42 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
 
   if (finalBusy) {
     for (const delayMs of sameServiceRetryDelays) {
-      await releaseFinalAttempt?.(true)
+      await releaseFinalAttempt?.({
+        countServiceError: true,
+        taskFailed: true,
+        detail: `HTTP ${upstreamRes.status}`,
+        statusCode: upstreamRes.status,
+      })
       releaseFinalAttempt = null
       retryCount += 1
       await writeRun({ retryCount })
+      await writeTask({ retryCount })
       await pushRunEvent('retry', {
         serviceId: selected.id,
         serviceName: selected.name,
         detail: `busy retry on same service after ${delayMs}ms`,
         metadata: { delayMs, attempt: retryCount },
       })
+      await pushTaskEvent('updated', `busy retry on ${selected.name}`, {
+        serviceId: selected.id,
+        serviceName: selected.name,
+        delayMs,
+        retryCount,
+      })
       await sleep(delayMs)
       try {
-        const result = await fetchUpstream(selected)
+        const result = await fetchUpstream(selected, 'busy_retry_same_service')
         upstreamRes = result.response
         selectedUrl = result.serviceUrl
         releaseFinalAttempt = result.release
         finalBusy = await isRetryableBusyResponse(upstreamRes)
         if (!finalBusy) break
-        await releaseFinalAttempt(true)
+        await releaseFinalAttempt({
+          countServiceError: true,
+          taskFailed: true,
+          detail: `HTTP ${upstreamRes.status}`,
+          statusCode: upstreamRes.status,
+        })
         releaseFinalAttempt = null
       } catch {
         releaseFinalAttempt = null
@@ -921,23 +1303,39 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
   }
 
   if (finalBusy && retryCandidates.length > 1) {
-    await releaseFinalAttempt?.(true)
+    await releaseFinalAttempt?.({
+      countServiceError: true,
+      taskFailed: true,
+      detail: `HTTP ${upstreamRes.status}`,
+      statusCode: upstreamRes.status,
+    })
     releaseFinalAttempt = null
     for (const candidate of retryCandidates) {
       if (candidate.id === selected.id) continue
       try {
         retryCount += 1
         await writeRun({ retryCount })
+        await writeTask({ retryCount })
         await pushRunEvent('retry', {
           serviceId: candidate.id,
           serviceName: candidate.name,
           detail: `switching candidate after busy response`,
           metadata: { attempt: retryCount, fromServiceId: selected.id },
         })
-        const result = await fetchUpstream(candidate)
+        await pushTaskEvent('updated', `switching candidate to ${candidate.name}`, {
+          fromServiceId: selected.id,
+          toServiceId: candidate.id,
+          retryCount,
+        })
+        const result = await fetchUpstream(candidate, 'busy_retry_switch_candidate')
         finalBusy = await isRetryableBusyResponse(result.response)
         if (finalBusy) {
-          await result.release(true)
+          await result.release({
+            countServiceError: true,
+            taskFailed: true,
+            detail: `HTTP ${result.response.status}`,
+            statusCode: result.response.status,
+          })
           continue
         }
         selected = candidate
@@ -984,6 +1382,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
   resHeaders.delete('content-length')
   resHeaders.set('x-orchestrator-gateway', 'llama.cpp_dashboard')
   resHeaders.set('x-orchestrator-run-id', runId)
+  resHeaders.set('x-orchestrator-task-id', taskId)
   if (selectedAgent) resHeaders.set('x-orchestrator-agent-profile', selectedAgent.id)
   resHeaders.set('x-orchestrator-service-id', selected.id)
   resHeaders.set('x-orchestrator-upstream', `${selected.host}:${selected.port}`)
@@ -1006,6 +1405,11 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
     retryCount,
     error: upstreamRes.ok ? undefined : `HTTP ${upstreamRes.status}`,
   })
+  await writeTask({
+    status: upstreamRes.ok ? 'running' : 'failed',
+    retryCount,
+    error: upstreamRes.ok ? undefined : `HTTP ${upstreamRes.status}`,
+  })
 
   const upstreamContentType = upstreamRes.headers.get('content-type') || ''
   const expectsStreaming =
@@ -1015,14 +1419,24 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
 
   if (!upstreamRes.ok) {
     return await createBufferedResponse(upstreamRes, resHeaders, async () => {
-      await releaseFinalAttempt?.(shouldCountServiceError(upstreamRes.status))
+      await releaseFinalAttempt?.({
+        countServiceError: shouldCountServiceError(upstreamRes.status),
+        taskFailed: true,
+        detail: `HTTP ${upstreamRes.status}`,
+        statusCode: upstreamRes.status,
+      })
       await finalizeRun('failed', `HTTP ${upstreamRes.status}`)
     })
   }
 
   if (!expectsStreaming) {
     return await createBufferedResponse(upstreamRes, resHeaders, async () => {
-      await releaseFinalAttempt?.(shouldCountServiceError(upstreamRes.status))
+      await releaseFinalAttempt?.({
+        countServiceError: shouldCountServiceError(upstreamRes.status),
+        taskFailed: !upstreamRes.ok,
+        detail: upstreamRes.ok ? 'completed' : `HTTP ${upstreamRes.status}`,
+        statusCode: upstreamRes.status,
+      })
       await finalizeRun(
         upstreamRes.ok ? 'completed' : 'failed',
         upstreamRes.ok ? undefined : `HTTP ${upstreamRes.status}`
@@ -1031,7 +1445,12 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
   }
 
   return createStreamingResponse(upstreamRes, resHeaders, async () => {
-    await releaseFinalAttempt?.(shouldCountServiceError(upstreamRes.status))
+    await releaseFinalAttempt?.({
+      countServiceError: shouldCountServiceError(upstreamRes.status),
+      taskFailed: !upstreamRes.ok,
+      detail: upstreamRes.ok ? 'completed' : `HTTP ${upstreamRes.status}`,
+      statusCode: upstreamRes.status,
+    })
     await finalizeRun(
       upstreamRes.ok ? 'completed' : 'failed',
       upstreamRes.ok ? undefined : `HTTP ${upstreamRes.status}`

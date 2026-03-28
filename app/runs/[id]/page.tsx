@@ -106,6 +106,7 @@ export default function RunDetailPage({ params }: { params: { id: string } }) {
               <InfoRow label="上游路径" value={run.upstreamPath} />
               <InfoRow label="Method" value={run.method} />
               <InfoRow label="Model" value={run.model || '无'} />
+              <InfoRow label="Agent" value={run.agentName || run.agentId || '无'} />
               <InfoRow label="Session" value={run.sessionId || '无'} />
               <InfoRow label="Service" value={run.serviceName || run.serviceId || '无'} />
               <InfoRow label="Host" value={run.serviceHost && run.servicePort ? `${run.serviceHost}:${run.servicePort}` : '无'} />

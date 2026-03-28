@@ -17,16 +17,19 @@ async function loadRunRecords(runIds: string[]): Promise<RunRecord[]> {
 export async function GET(request: NextRequest) {
   try {
     const { searchParams } = new URL(request.url)
+    const agentId = searchParams.get('agentId') || undefined
     const sessionId = searchParams.get('sessionId') || undefined
     const serviceId = searchParams.get('serviceId') || undefined
     const status = (searchParams.get('status') as RunStatus | null) || undefined
     const model = searchParams.get('model') || undefined
     const limit = normalizeLimit(searchParams.get('limit'))
 
-    const baseKey = sessionId && !serviceId
-      ? KEYS.RUNS_BY_SESSION(sessionId)
-      : serviceId && !sessionId
-        ? KEYS.RUNS_BY_SERVICE(serviceId)
+    const baseKey = agentId && !sessionId && !serviceId
+      ? KEYS.RUNS_BY_AGENT(agentId)
+      : sessionId && !agentId && !serviceId
+        ? KEYS.RUNS_BY_SESSION(sessionId)
+        : serviceId && !agentId && !sessionId
+          ? KEYS.RUNS_BY_SERVICE(serviceId)
         : KEYS.RUNS_RECENT
 
     const scanCount = Math.min(500, Math.max(50, limit * 6))
@@ -34,6 +37,7 @@ export async function GET(request: NextRequest) {
     const runsRaw = await loadRunRecords(runIds)
 
     const filtered = runsRaw.filter((run) => {
+      if (agentId && run.agentId !== agentId) return false
       if (sessionId && run.sessionId !== sessionId) return false
       if (serviceId && run.serviceId !== serviceId) return false
       if (status && run.status !== status) return false
