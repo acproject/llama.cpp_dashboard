@@ -7,7 +7,8 @@ import {
   Zap, 
   AlertCircle,
   RefreshCw,
-  TrendingUp
+  TrendingUp,
+  MessagesSquare
 } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
@@ -144,6 +145,10 @@ export default function HomePage() {
       <div className="mb-8">
         <h2 className="text-xl font-semibold mb-4">快速操作</h2>
         <div className="flex flex-wrap gap-4">
+          <Button onClick={() => window.location.href = '/chat'}>
+            <MessagesSquare className="h-4 w-4 mr-2" />
+            打开聊天
+          </Button>
           <Button onClick={() => window.location.href = '/services'}>
             <Server className="h-4 w-4 mr-2" />
             管理服务

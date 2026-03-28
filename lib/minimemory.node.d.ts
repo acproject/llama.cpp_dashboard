@@ -18,6 +18,21 @@ export interface CallOptions {
   timeoutMs?: number;
 }
 
+export interface GraphNeighborsX2Options {
+  edgeMetaKeys?: string[];
+  fromMetaKeys?: string[];
+  toMetaKeys?: string[];
+}
+
+export interface EvidenceSearchFOptions {
+  tag?: string[];
+  meta?: Record<string, string | number | boolean | null>;
+  keyPrefix?: string;
+  graphFrom?: string;
+  graphRel?: string;
+  graphDepth?: number;
+}
+
 export declare class MiniMemoryClient {
   constructor(options?: MiniMemoryClientOptions);
   connect(): Promise<void>;
@@ -39,9 +54,24 @@ export declare class MiniMemoryClient {
   metaset(subject: string, field: string, value: string): Promise<string>;
   metaget(subject: string, field: string): Promise<string | Buffer | null>;
   tagadd(subject: string, ...tags: string[]): Promise<string>;
+  hotset(subject: string, flag: string | number | boolean): Promise<string>;
+  objset(key: string, mime: string, data: string | Buffer): Promise<string>;
+  objget(key: string): Promise<string | Buffer | null>;
   graphAddEdge(from: string, rel: string, to: string): Promise<string>;
   graphDelEdge(from: string, rel: string, to: string): Promise<string>;
   graphHasEdge(from: string, rel: string, to: string): Promise<number | string>;
+  graphEdgePropSet(from: string, rel: string, to: string, field: string, value: string): Promise<string>;
+  graphEdgePropGet(from: string, rel: string, to: string, field?: string): Promise<RespValue>;
+  graphNeighborsX2(node: string, rel?: string, limit?: number, options?: GraphNeighborsX2Options): Promise<RespValue>;
+  evidenceSearchF(
+    topk: number,
+    metric: string,
+    dim: number,
+    queryVector: Array<number | string>,
+    options?: EvidenceSearchFOptions
+  ): Promise<RespValue>;
+  embed(mode: string, text: string): Promise<RespValue>;
+  embedSet(key: string, mode: string, text: string): Promise<RespValue>;
 }
 
 export declare function createClient(options?: MiniMemoryClientOptions): MiniMemoryClient;

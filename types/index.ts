@@ -118,6 +118,71 @@ export interface AgentImportedCapabilitySource extends OpenSourceCapabilityCatal
   importedAt: number
 }
 
+export type RagMetric = 'cosine' | 'l2' | 'ip'
+
+export interface RagCollection {
+  id: string
+  name: string
+  description?: string
+  embeddingServiceId?: string
+  embeddingModel?: string
+  embeddingSpace: string
+  embeddingDimension?: number
+  metric: RagMetric
+  graphRootNode: string
+  graphRelation: string
+  chunkSize: number
+  chunkOverlap: number
+  enabled: boolean
+  documentCount: number
+  chunkCount: number
+  createdAt: number
+  updatedAt: number
+  metadata?: Record<string, unknown>
+}
+
+export interface RagDocument {
+  id: string
+  collectionId: string
+  title: string
+  source?: string
+  tags: string[]
+  graphNodes: string[]
+  chunkCount: number
+  contentPreview?: string
+  createdAt: number
+  updatedAt: number
+  metadata?: Record<string, unknown>
+}
+
+export interface RagChunkRecord {
+  id: string
+  collectionId: string
+  documentId: string
+  chunkIndex: number
+  chunkKey: string
+  embeddingKey: string
+  title?: string
+  source?: string
+  content: string
+  tags: string[]
+  graphNodes: string[]
+  createdAt: number
+  metadata?: Record<string, unknown>
+}
+
+export interface RagRetrievalHit {
+  chunkId: string
+  documentId: string
+  title?: string
+  source?: string
+  content: string
+  score: number | null
+  tags: string[]
+  graphNodes: string[]
+  metadata?: Record<string, unknown>
+}
+
 export type RunStatus = 'received' | 'routed' | 'running' | 'completed' | 'failed'
 
 export type RunEventType = 'received' | 'parsed' | 'routed' | 'retry' | 'completed' | 'failed'

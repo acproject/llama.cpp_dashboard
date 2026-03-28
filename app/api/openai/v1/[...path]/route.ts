@@ -3,6 +3,7 @@ import { decr, getJson, getNumber, incr, keys, KEYS, pushJsonList, setJson } fro
 import { AgentProfile, DispatchConfig, LlamaService, RunEventType, RunRecord, SessionRecord, TaskPriority } from '@/types'
 import { listAgents } from '@/lib/agents'
 import { getDispatchConfig } from '@/lib/orchestrator'
+import { retrieveRagContext } from '@/lib/rag'
 import { addTaskChild, appendTaskEvent, createTask, releaseTaskLease, setTaskResult, updateTask, upsertTaskLease } from '@/lib/tasks'
 import { generateId } from '@/lib/utils'
 
@@ -27,6 +28,20 @@ type StickyRoute = {
 const RUN_TTL_MS = 24 * 60 * 60 * 1000
 const RUN_EVENTS_LIMIT = 200
 const RUN_LIST_LIMIT = 200
+
+type RagRequestConfig = {
+  collectionId: string
+  query?: string
+  topK?: number
+  tags: string[]
+  graphNodes: string[]
+}
+
+type RagResolution = {
+  config: RagRequestConfig
+  contextText: string
+  hitCount: number
+}
 
 function getSessionKey(request: NextRequest, parsedJson: any): string | null {
   const sessionId = parsedJson?.session_id
@@ -435,6 +450,246 @@ function getRequestedTaskPriority(request: NextRequest, parsedJson: any): TaskPr
   return 'normal'
 }
 
+function normalizeCsvValues(input: unknown): string[] {
+  if (Array.isArray(input)) {
+    return Array.from(new Set(input.map((item) => String(item || '').trim()).filter(Boolean)))
+  }
+  if (typeof input === 'string') {
+    return Array.from(new Set(input.split(',').map((item) => item.trim()).filter(Boolean)))
+  }
+  return []
+}
+
+function getRequestedRagConfig(request: NextRequest, parsedJson: any): RagRequestConfig | null {
+  const rag = parsedJson?.rag
+  const metadataRag = parsedJson?.metadata?.rag
+  const collectionIdCandidates = [
+    rag?.collectionId,
+    rag?.collection_id,
+    metadataRag?.collectionId,
+    metadataRag?.collection_id,
+    request.headers.get('x-rag-collection'),
+  ]
+
+  let collectionId = ''
+  for (const candidate of collectionIdCandidates) {
+    if (typeof candidate === 'string' && candidate.trim()) {
+      collectionId = candidate.trim()
+      break
+    }
+  }
+
+  if (!collectionId) return null
+
+  const queryCandidates = [
+    rag?.query,
+    metadataRag?.query,
+    request.headers.get('x-rag-query'),
+  ]
+
+  let query: string | undefined
+  for (const candidate of queryCandidates) {
+    if (typeof candidate === 'string' && candidate.trim()) {
+      query = candidate.trim()
+      break
+    }
+  }
+
+  const topKCandidates = [
+    rag?.topK,
+    rag?.top_k,
+    metadataRag?.topK,
+    metadataRag?.top_k,
+    request.headers.get('x-rag-top-k'),
+  ]
+
+  let topK: number | undefined
+  for (const candidate of topKCandidates) {
+    const parsed = Number(candidate)
+    if (Number.isFinite(parsed) && parsed > 0) {
+      topK = parsed
+      break
+    }
+  }
+
+  const tagValues = [
+    ...normalizeCsvValues(rag?.tags),
+    ...normalizeCsvValues(metadataRag?.tags),
+    ...normalizeCsvValues(request.headers.get('x-rag-tags')),
+  ]
+  const graphNodes = [
+    ...normalizeCsvValues(rag?.graphNodes),
+    ...normalizeCsvValues(rag?.graph_nodes),
+    ...normalizeCsvValues(metadataRag?.graphNodes),
+    ...normalizeCsvValues(metadataRag?.graph_nodes),
+    ...normalizeCsvValues(request.headers.get('x-rag-graph-nodes')),
+  ]
+
+  return {
+    collectionId,
+    query,
+    topK,
+    tags: Array.from(new Set(tagValues)),
+    graphNodes: Array.from(new Set(graphNodes)),
+  }
+}
+
+function getTextFromMessageContent(content: unknown): string {
+  if (typeof content === 'string') return content.trim()
+  if (!Array.isArray(content)) return ''
+  return content
+    .map((part) => {
+      if (typeof part === 'string') return part
+      if (!part || typeof part !== 'object') return ''
+      const record = part as Record<string, unknown>
+      if (record.type === 'text' && typeof record.text === 'string') return record.text
+      return ''
+    })
+    .filter(Boolean)
+    .join('\n')
+    .trim()
+}
+
+function appendTextToMessageContent(content: unknown, appendedText: string): unknown {
+  if (typeof content === 'string') {
+    return content.trim() ? `${content}\n\n${appendedText}` : appendedText
+  }
+  if (Array.isArray(content)) {
+    return [
+      ...content,
+      {
+        type: 'text',
+        text: appendedText,
+      },
+    ]
+  }
+  return appendedText
+}
+
+function getQueryFromChatMessages(messages: unknown): string {
+  if (!Array.isArray(messages)) return ''
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index]
+    if (!message || typeof message !== 'object') continue
+    const record = message as Record<string, unknown>
+    const role = typeof record.role === 'string' ? record.role : ''
+    if (role !== 'user') continue
+    const text = getTextFromMessageContent(record.content)
+    if (text) return text
+  }
+
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index]
+    if (!message || typeof message !== 'object') continue
+    const record = message as Record<string, unknown>
+    const text = getTextFromMessageContent(record.content)
+    if (text) return text
+  }
+
+  return ''
+}
+
+function getQueryFromPrompt(prompt: unknown): string {
+  if (typeof prompt === 'string') return prompt.trim()
+  if (!Array.isArray(prompt)) return ''
+  return prompt
+    .filter((item): item is string => typeof item === 'string')
+    .join('\n')
+    .trim()
+}
+
+function resolveRagQuery(upstreamPath: string, parsedJson: any, ragConfig: RagRequestConfig): string {
+  if (ragConfig.query) return ragConfig.query
+  if (upstreamPath === '/v1/chat/completions') return getQueryFromChatMessages(parsedJson?.messages)
+  if (upstreamPath === '/v1/completions') return getQueryFromPrompt(parsedJson?.prompt)
+  return ''
+}
+
+function buildRagSystemText(input: { collectionId: string; contextText: string; hitCount: number }): string {
+  return [
+    `以下内容来自 RAG 检索结果，集合 ID: ${input.collectionId}，命中 ${input.hitCount} 条片段。`,
+    '请优先基于这些上下文回答；如果上下文不足，请明确说明，并再结合你自己的通用知识补充。',
+    '',
+    input.contextText,
+  ].join('\n')
+}
+
+function injectRagIntoChatBody(body: any, rag: RagResolution): any {
+  if (!body || typeof body !== 'object' || !Array.isArray(body.messages)) return body
+  const messages = [...body.messages]
+  const ragText = buildRagSystemText({
+    collectionId: rag.config.collectionId,
+    contextText: rag.contextText,
+    hitCount: rag.hitCount,
+  })
+
+  const firstSystemIndex = messages.findIndex((message) => {
+    return message && typeof message === 'object' && (message as Record<string, unknown>).role === 'system'
+  })
+
+  if (firstSystemIndex >= 0) {
+    const existing = messages[firstSystemIndex]
+    const existingRecord = existing as Record<string, unknown>
+    messages[firstSystemIndex] = {
+      ...existingRecord,
+      content: appendTextToMessageContent(existingRecord.content, ragText),
+    }
+  } else {
+    messages.unshift({
+      role: 'system',
+      content: ragText,
+    })
+  }
+
+  return {
+    ...body,
+    messages,
+  }
+}
+
+function injectRagIntoCompletionBody(body: any, rag: RagResolution): any {
+  if (!body || typeof body !== 'object') return body
+  const ragText = [
+    `[RAG CONTEXT | collection=${rag.config.collectionId} | hits=${rag.hitCount}]`,
+    rag.contextText,
+    '',
+  ].join('\n')
+
+  if (typeof body.prompt === 'string') {
+    return {
+      ...body,
+      prompt: `${ragText}${body.prompt}`,
+    }
+  }
+
+  if (Array.isArray(body.prompt) && body.prompt.every((item: unknown) => typeof item === 'string')) {
+    const prompts = [...body.prompt]
+    prompts[0] = `${ragText}${prompts[0] || ''}`
+    return {
+      ...body,
+      prompt: prompts,
+    }
+  }
+
+  return body
+}
+
+function stripGatewayOnlyFields(body: any): any {
+  if (!body || typeof body !== 'object') return body
+  const cleaned = { ...body }
+  delete cleaned.rag
+
+  if (cleaned.metadata && typeof cleaned.metadata === 'object' && !Array.isArray(cleaned.metadata)) {
+    const nextMetadata = { ...(cleaned.metadata as Record<string, unknown>) }
+    delete nextMetadata.rag
+    delete nextMetadata.rag_collectionId
+    delete nextMetadata.rag_collection_id
+    cleaned.metadata = nextMetadata
+  }
+
+  return cleaned
+}
+
 function toOpenAIErrorPayload(input: {
   message: string
   type?:
@@ -651,6 +906,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
     parsedJson && typeof parsedJson === 'object'
       ? parsedJson
       : { model: hintedModel, session_id: hintedSessionId }
+  const requestedRag = getRequestedRagConfig(request, routingHints)
 
   const requestedAgentId = getRequestedAgentId(request, routingHints)
   let model = typeof routingHints?.model === 'string' ? routingHints.model : null
@@ -715,6 +971,14 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
       requestedAgentId: requestedAgentId || null,
       contentType: contentType || null,
       stream: parsedJson?.stream === true,
+      rag: requestedRag
+        ? {
+            collectionId: requestedRag.collectionId,
+            topK: requestedRag.topK || null,
+            tags: requestedRag.tags,
+            graphNodes: requestedRag.graphNodes,
+          }
+        : null,
     },
   })
   const taskId = rootTask.id
@@ -783,6 +1047,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
   let agentRuntimeStarted = false
   let agentRuntimeReleased = false
   let taskLeaseReleased = false
+  let ragResolution: RagResolution | null = null
 
   const startAgentRuntime = async () => {
     if (!selectedAgent || agentRuntimeStarted) return
@@ -882,6 +1147,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
       model: model || null,
       sessionId: rawSessionKey || null,
       agentId: requestedAgentId || null,
+      ragCollectionId: requestedRag?.collectionId || null,
     },
   })
   await pushTaskEvent('status_changed', 'request parsed into task context', {
@@ -891,6 +1157,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
     selectedAgentId: selectedAgent?.id || null,
     agentSelectionMode,
     requiredCapabilities,
+    ragCollectionId: requestedRag?.collectionId || null,
   })
   if (selectedAgent && agentSelectionMode === 'auto' && !requestedAgentId) {
     await pushRunEvent('parsed', {
@@ -1091,9 +1358,89 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
   })
   await pushRunIndex(KEYS.RUNS_BY_SERVICE(selected.id))
 
+  if (requestedRag) {
+    const ragQuery = resolveRagQuery(upstreamPath, parsedJson, requestedRag)
+    if (!ragQuery) {
+      await writeRun({ status: 'failed' })
+      await writeTask({ error: 'RAG query cannot be derived from the request' })
+      await finalizeRun('failed', 'RAG query cannot be derived from the request')
+      return withRunHeader(NextResponse.json(
+        toOpenAIErrorPayload({
+          message: 'RAG query cannot be derived from the request. Provide rag.query or include a textual user prompt.',
+          type: 'invalid_request_error',
+          param: 'rag.query',
+        }),
+        { status: 400 }
+      ), runId, taskId)
+    }
+
+    try {
+      const ragResult = await retrieveRagContext({
+        collectionId: requestedRag.collectionId,
+        query: ragQuery,
+        topK: requestedRag.topK,
+        tags: requestedRag.tags,
+        graphNodes: requestedRag.graphNodes,
+      })
+
+      ragResolution = {
+        config: requestedRag,
+        contextText: ragResult.contextText,
+        hitCount: ragResult.hits.length,
+      }
+
+      await pushRunEvent('parsed', {
+        detail: `rag context injected from collection ${requestedRag.collectionId}`,
+        metadata: {
+          ragCollectionId: requestedRag.collectionId,
+          ragHitCount: ragResult.hits.length,
+          ragTopK: requestedRag.topK || null,
+          ragTags: requestedRag.tags,
+          ragGraphNodes: requestedRag.graphNodes,
+        },
+      })
+      await pushTaskEvent('updated', `rag context injected from ${requestedRag.collectionId}`, {
+        ragCollectionId: requestedRag.collectionId,
+        ragHitCount: ragResult.hits.length,
+        ragTopK: requestedRag.topK || null,
+        ragTags: requestedRag.tags,
+        ragGraphNodes: requestedRag.graphNodes,
+      })
+    } catch (error) {
+      const message = String(error)
+      const invalidRagRequest =
+        message.includes('not found') ||
+        message.includes('不能为空') ||
+        message.includes('不存在') ||
+        message.includes('missing') ||
+        message.includes('required')
+      await writeRun({ status: 'failed', error: message })
+      await writeTask({ error: message })
+      await finalizeRun('failed', message)
+      return withRunHeader(NextResponse.json(
+        toOpenAIErrorPayload({
+          message,
+          type: invalidRagRequest ? 'invalid_request_error' : 'server_error',
+          param: 'rag.collectionId',
+        }),
+        {
+          status: invalidRagRequest ? 400 : 502,
+        }
+      ), runId, taskId)
+    }
+  }
+
   if (parsedJson && typeof parsedJson === 'object' && parsedJson.model == null && selected.model) {
     parsedJson = { ...parsedJson, model: selected.model }
   }
+  if (ragResolution) {
+    if (upstreamPath === '/v1/chat/completions') {
+      parsedJson = injectRagIntoChatBody(parsedJson, ragResolution)
+    } else if (upstreamPath === '/v1/completions') {
+      parsedJson = injectRagIntoCompletionBody(parsedJson, ragResolution)
+    }
+  }
+  parsedJson = stripGatewayOnlyFields(parsedJson)
   parsedJson = sanitizeBodyForLlamaCpp(upstreamPath, parsedJson, Boolean(selected.supportsTools))
 
   const headers = new Headers()
@@ -1392,6 +1739,10 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
   resHeaders.set('x-orchestrator-candidates', String(candidateCount))
   resHeaders.set('x-orchestrator-scheduling', schedulingMode)
   resHeaders.set('x-orchestrator-retries', String(retryCount))
+  if (ragResolution) {
+    resHeaders.set('x-orchestrator-rag-collection', ragResolution.config.collectionId)
+    resHeaders.set('x-orchestrator-rag-hits', String(ragResolution.hitCount))
+  }
   if (selectedUrl) resHeaders.set('x-orchestrator-final-url', selectedUrl)
 
   await writeRun({

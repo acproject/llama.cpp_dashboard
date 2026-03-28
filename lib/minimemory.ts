@@ -1,4 +1,11 @@
-import { createClient, MiniMemoryClient, MiniMemoryClientOptions } from './minimemory.node'
+import {
+  createClient,
+  type EvidenceSearchFOptions,
+  type GraphNeighborsX2Options,
+  MiniMemoryClient,
+  MiniMemoryClientOptions,
+  type RespValue,
+} from './minimemory.node'
 
 // MiniMemory configuration
 const MINIMEMORY_HOST = process.env.MINIMEMORY_HOST || 'localhost'
@@ -43,6 +50,10 @@ export const KEYS = {
   TASK_LEASE: (id: string) => `task:lease:${id}`,
   TASK_RESULT: (id: string) => `task:result:${id}`,
   TASK_QUEUE: (queueName: string) => `task:queue:${queueName}`,
+  RAG_COLLECTION: (id: string) => `rag:collection:${id}`,
+  RAG_DOCUMENT: (collectionId: string, documentId: string) => `rag:document:${collectionId}:${documentId}`,
+  RAG_CHUNK: (collectionId: string, documentId: string, chunkIndex: number) =>
+    `rag:chunk:${collectionId}:${documentId}:${chunkIndex}`,
 }
 
 export function getClient(): MiniMemoryClient {
@@ -114,6 +125,21 @@ export async function setJson<T>(key: string, value: T, ttlMs?: number): Promise
 export async function deleteKey(key: string): Promise<void> {
   await withClient(async (client) => {
     await client.del(key)
+  })
+}
+
+export async function callMinimemory(
+  args: Array<string | number | boolean | null | undefined>
+): Promise<RespValue> {
+  return await withClient(async (client) => client.call(args))
+}
+
+export async function setString(key: string, value: string, ttlMs?: number): Promise<void> {
+  await withClient(async (client) => {
+    await client.set(key, value)
+    if (ttlMs) {
+      await client.pexpire(key, ttlMs)
+    }
   })
 }
 
@@ -211,9 +237,48 @@ export async function graphHasEdge(from: string, rel: string, to: string): Promi
   return result === 1 || result === '1'
 }
 
+export async function graphEdgePropSet(
+  from: string,
+  rel: string,
+  to: string,
+  field: string,
+  value: string
+): Promise<string> {
+  return await withClient(async (client) => client.graphEdgePropSet(from, rel, to, field, value))
+}
+
+export async function graphNeighborsX2(
+  node: string,
+  rel?: string,
+  limit?: number,
+  options?: GraphNeighborsX2Options
+): Promise<RespValue> {
+  return await withClient(async (client) => client.graphNeighborsX2(node, rel, limit, options))
+}
+
 // Tag operations (MiniMemory specific)
 export async function tagadd(key: string, ...tags: string[]): Promise<string> {
   return await withClient(async (client) => client.tagadd(key, ...tags))
+}
+
+export async function objset(key: string, mime: string, data: string): Promise<string> {
+  return await withClient(async (client) => client.objset(key, mime, data))
+}
+
+export async function objget(key: string): Promise<string | null> {
+  const result = await withClient(async (client) => client.objget(key))
+  if (result === null) return null
+  return Buffer.isBuffer(result) ? result.toString('utf-8') : String(result)
+}
+
+export async function evidenceSearchF(
+  topk: number,
+  metric: string,
+  dim: number,
+  queryVector: Array<number | string>,
+  options?: EvidenceSearchFOptions
+): Promise<RespValue> {
+  return await withClient(async (client) => client.evidenceSearchF(topk, metric, dim, queryVector, options))
 }
 
 // List operations for logs
