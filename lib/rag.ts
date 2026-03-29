@@ -9,6 +9,7 @@ const DEFAULT_GRAPH_RELATION = 'HAS_CHUNK'
 const DEFAULT_GRAPH_DEPTH = 1
 const DEFAULT_EMBEDDING_SPACE = 'e5-multi-large-instruct_d1024_cosine'
 const CHUNK_MIME = 'text/plain'
+const MIN_EMBEDDING_CHUNK_SIZE = 180
 
 type CollectionInput = {
   name?: string
@@ -47,6 +48,11 @@ type EmbeddingResponse = {
   data?: Array<{
     embedding?: number[]
   }>
+}
+
+type ChunkEmbeddingResult = {
+  chunks: string[]
+  vectors: number[][]
 }
 
 function normalizeStringArray(values: unknown): string[] {
@@ -213,7 +219,24 @@ async function fetchEmbeddings(service: LlamaService, input: string[]): Promise<
   })
 
   if (!response.ok) {
-    throw new Error(`Embeddings 服务调用失败: ${response.status} ${response.statusText}`)
+    const bodyText = await response.text()
+    let detail = bodyText.trim()
+    if (detail) {
+      try {
+        const parsed = JSON.parse(detail) as {
+          error?: {
+            message?: string
+          }
+        }
+        detail = parsed.error?.message?.trim() || detail
+      } catch {}
+    }
+
+    throw new Error(
+      detail
+        ? `Embeddings 服务调用失败: ${response.status} ${response.statusText} - ${detail}`
+        : `Embeddings 服务调用失败: ${response.status} ${response.statusText}`
+    )
   }
 
   const payload = (await response.json()) as EmbeddingResponse
@@ -226,6 +249,81 @@ async function fetchEmbeddings(service: LlamaService, input: string[]): Promise<
   }
 
   return vectors
+}
+
+function isEmbeddingInputTooLarge(message: string): boolean {
+  return message.includes('too large to process') || (message.includes('input (') && message.includes('tokens'))
+}
+
+function splitChunkForEmbedding(chunk: string): string[] {
+  const preferredSize = Math.max(
+    MIN_EMBEDDING_CHUNK_SIZE,
+    Math.min(Math.floor(chunk.length * 0.6), chunk.length - 1)
+  )
+
+  if (preferredSize >= chunk.length) {
+    const midpoint = Math.max(1, Math.floor(chunk.length / 2))
+    return [chunk.slice(0, midpoint).trim(), chunk.slice(midpoint).trim()].filter(Boolean)
+  }
+
+  const overlap = Math.min(Math.floor(preferredSize / 5), 60)
+  return splitTextIntoChunks(chunk, preferredSize, overlap).filter(Boolean)
+}
+
+async function embedChunkWithFallback(service: LlamaService, chunk: string): Promise<ChunkEmbeddingResult> {
+  const normalizedChunk = String(chunk || '').trim()
+  if (!normalizedChunk) {
+    return {
+      chunks: [],
+      vectors: [],
+    }
+  }
+
+  try {
+    const vectors = await fetchEmbeddings(service, [buildPassageInput(normalizedChunk)])
+    return {
+      chunks: [normalizedChunk],
+      vectors,
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    if (!isEmbeddingInputTooLarge(message)) {
+      throw error
+    }
+
+    const smallerChunks = splitChunkForEmbedding(normalizedChunk)
+    if (smallerChunks.length <= 1 || smallerChunks.some((item) => item === normalizedChunk)) {
+      throw new Error(`文档分块超过 embeddings 服务限制，且无法继续缩小: ${message}`)
+    }
+
+    const embedded = await Promise.all(smallerChunks.map((item) => embedChunkWithFallback(service, item)))
+    return embedded.reduce<ChunkEmbeddingResult>(
+      (accumulator, item) => {
+        accumulator.chunks.push(...item.chunks)
+        accumulator.vectors.push(...item.vectors)
+        return accumulator
+      },
+      {
+        chunks: [],
+        vectors: [],
+      }
+    )
+  }
+}
+
+async function embedDocumentChunks(service: LlamaService, chunks: string[]): Promise<ChunkEmbeddingResult> {
+  const result: ChunkEmbeddingResult = {
+    chunks: [],
+    vectors: [],
+  }
+
+  for (const chunk of chunks) {
+    const embedded = await embedChunkWithFallback(service, chunk)
+    result.chunks.push(...embedded.chunks)
+    result.vectors.push(...embedded.vectors)
+  }
+
+  return result
 }
 
 async function ensureGraphMetadata(collection: RagCollection, document: RagDocument, graphNodes: string[]): Promise<void> {
@@ -406,13 +504,13 @@ export async function ingestRagDocument(collectionId: string, input: DocumentInp
     throw new Error('文档内容不能为空')
   }
 
-  const chunks = splitTextIntoChunks(content, collection.chunkSize, collection.chunkOverlap)
-  if (!chunks.length) {
+  const initialChunks = splitTextIntoChunks(content, collection.chunkSize, collection.chunkOverlap)
+  if (!initialChunks.length) {
     throw new Error('文档切块后为空')
   }
 
   const service = await resolveEmbeddingService(collection)
-  const vectors = await fetchEmbeddings(service, chunks.map((chunk) => buildPassageInput(chunk)))
+  const { chunks, vectors } = await embedDocumentChunks(service, initialChunks)
   const documentId = generateId()
   const tags = normalizeStringArray(input.tags)
   const graphNodes = normalizeStringArray(input.graphNodes)
