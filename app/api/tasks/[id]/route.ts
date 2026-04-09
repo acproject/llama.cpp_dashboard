@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { deleteTask, getTask, getTaskLease, getTaskResult, listTaskChildren, listTaskEvents, updateTask } from '@/lib/tasks'
+import { deleteTask, getTask, getTaskLease, getTaskResult, listTaskChildren, listTaskEvents, listTaskEvidence, updateTask } from '@/lib/tasks'
 
 export async function GET(
   request: NextRequest,
@@ -24,6 +24,7 @@ export async function GET(
         children: await listTaskChildren(id),
         lease: await getTaskLease(id),
         result: await getTaskResult(id),
+        evidence: await listTaskEvidence(id),
       },
     })
   } catch (error) {

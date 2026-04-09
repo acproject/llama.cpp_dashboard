@@ -1,7 +1,7 @@
 'use client'
 
 import Link from 'next/link'
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import * as Dialog from '@radix-ui/react-dialog'
 import {
   Activity,
@@ -21,6 +21,7 @@ import {
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { MonitorData, RunRecord, SessionBindingView, TaskEvent, TaskLease, TaskRecord, TaskResult, TaskRuntimeView } from '@/types'
 import { formatDuration, formatTimestamp, getStatusBgColor } from '@/lib/utils'
@@ -32,6 +33,8 @@ type TaskDetailData = {
   lease: TaskLease | null
   result: TaskResult | null
 }
+
+type ExecutorMode = 'payload' | 'success' | 'fail'
 
 export default function MonitorPage() {
   const [data, setData] = useState<MonitorData | null>(null)
@@ -47,6 +50,15 @@ export default function MonitorPage() {
   const [taskDetail, setTaskDetail] = useState<TaskDetailData | null>(null)
   const [taskDetailLoading, setTaskDetailLoading] = useState(false)
   const [taskDetailError, setTaskDetailError] = useState<string | null>(null)
+  const [executorRunning, setExecutorRunning] = useState(false)
+  const [executorMode, setExecutorMode] = useState<ExecutorMode>('payload')
+  const [executorPollMs, setExecutorPollMs] = useState('3000')
+  const [executorProcessMs, setExecutorProcessMs] = useState('5000')
+  const [executorHeartbeatMs, setExecutorHeartbeatMs] = useState('15000')
+  const [executorActiveTaskId, setExecutorActiveTaskId] = useState<string | null>(null)
+  const [executorStatus, setExecutorStatus] = useState<string>('空闲')
+  const executorRunningRef = useRef(false)
+  const executorActiveTaskIdRef = useRef<string | null>(null)
 
   const fetchData = useCallback(async () => {
     try {
@@ -113,6 +125,13 @@ export default function MonitorPage() {
       setTaskActionError(error instanceof Error ? error.message : String(error))
     } finally {
       setTaskActionKey(null)
+    }
+  }, [detailTaskId, fetchData, fetchTaskDetail])
+
+  const syncTaskViews = useCallback(async () => {
+    await fetchData()
+    if (detailTaskId) {
+      await fetchTaskDetail(detailTaskId)
     }
   }, [detailTaskId, fetchData, fetchTaskDetail])
 
@@ -191,6 +210,126 @@ export default function MonitorPage() {
     )
   }, [executorId, runTaskAction])
 
+  const postTaskRequest = useCallback(async <T,>(
+    url: string,
+    body: Record<string, unknown>
+  ): Promise<T> => {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+    const result = await response.json().catch(() => ({}))
+    if (!response.ok || !result.success) {
+      throw new Error(result.error || '执行器请求失败')
+    }
+    return result.data as T
+  }, [])
+
+  const runExecutorCycle = useCallback(async (): Promise<boolean> => {
+    const holderId = executorId.trim()
+    const queueName = selectedQueue.trim()
+    if (!holderId || !queueName) {
+      throw new Error('请先填写执行器 ID 和默认队列')
+    }
+
+    const pollMs = normalizeDurationInput(executorPollMs, 3000)
+    const processMs = normalizeDurationInput(executorProcessMs, 5000)
+    const heartbeatMs = normalizeDurationInput(executorHeartbeatMs, 15000)
+
+    await postTaskRequest<{ scanned: number; expired: number }>(
+      '/api/tasks/recover-expired',
+      {
+        queueName,
+        actorId: holderId,
+        actorType: 'worker',
+        reason: `lease expired while monitored by ${holderId}`,
+      }
+    )
+
+    setExecutorStatus(`扫描队列 ${queueName}...`)
+    const claimData = await postTaskRequest<{ task?: TaskRecord; lease?: TaskLease }>(
+      '/api/tasks/claim-next',
+      {
+        queueName,
+        holderId,
+        holderType: 'worker',
+      }
+    )
+
+    if (!claimData?.task) {
+      setExecutorStatus(`${queueName} 暂无可认领任务，${pollMs}ms 后继续轮询`)
+      await syncTaskViews()
+      return false
+    }
+
+    const task = claimData.task
+    setExecutorActiveTaskId(task.id)
+    setExecutorStatus(`执行任务 ${task.title}`)
+    await syncTaskViews()
+
+    const heartbeatId = window.setInterval(() => {
+      if (!executorRunningRef.current) return
+      void postTaskRequest(`/api/tasks/${task.id}/heartbeat`, {
+        holderId,
+        ttlMs: Math.max(heartbeatMs * 2, 30000),
+        metadata: {
+          source: 'monitor-executor',
+          queueName,
+        },
+      }).then(() => {
+        setExecutorStatus(`任务 ${task.title} 心跳续租中`)
+      }).catch((error) => {
+        setTaskActionError(error instanceof Error ? error.message : String(error))
+      })
+    }, heartbeatMs)
+
+    try {
+      await waitMs(processMs)
+      const outcome = resolveExecutorOutcome(task, executorMode)
+      if (outcome === 'fail') {
+        await postTaskRequest(`/api/tasks/${task.id}/fail`, {
+          summary: buildExecutorSummary(task, holderId, 'failed'),
+          holderId,
+          metadata: {
+            source: 'monitor-executor',
+            queueName,
+          },
+        })
+        setExecutorStatus(`任务 ${task.title} 已标记失败`)
+      } else {
+        await postTaskRequest(`/api/tasks/${task.id}/complete`, {
+          summary: buildExecutorSummary(task, holderId, 'completed'),
+          holderId,
+          output: {
+            executorId: holderId,
+            queueName,
+            processedAt: Date.now(),
+          },
+          metadata: {
+            source: 'monitor-executor',
+            queueName,
+          },
+        })
+        setExecutorStatus(`任务 ${task.title} 已自动完成`)
+      }
+      await syncTaskViews()
+      return true
+    } finally {
+      window.clearInterval(heartbeatId)
+      setExecutorActiveTaskId(null)
+    }
+  }, [
+    executorHeartbeatMs,
+    executorId,
+    executorMode,
+    executorPollMs,
+    executorProcessMs,
+    postTaskRequest,
+    selectedQueue,
+    syncTaskViews,
+  ])
+
   useEffect(() => {
     fetchData()
     const interval = setInterval(fetchData, 5000)
@@ -206,6 +345,47 @@ export default function MonitorPage() {
     }
     fetchTaskDetail(detailTaskId)
   }, [detailTaskId, fetchTaskDetail])
+
+  useEffect(() => {
+    executorActiveTaskIdRef.current = executorActiveTaskId
+  }, [executorActiveTaskId])
+
+  useEffect(() => {
+    if (!executorRunning) {
+      executorRunningRef.current = false
+      if (!executorActiveTaskIdRef.current) {
+        setExecutorStatus('空闲')
+      }
+      return
+    }
+
+    executorRunningRef.current = true
+    let cancelled = false
+
+    const loop = async () => {
+      while (!cancelled && executorRunningRef.current) {
+        try {
+          await runExecutorCycle()
+        } catch (error) {
+          setTaskActionError(error instanceof Error ? error.message : String(error))
+          setExecutorStatus('执行器遇到错误，等待下一次轮询')
+        }
+
+        if (cancelled || !executorRunningRef.current) {
+          break
+        }
+
+        await waitMs(normalizeDurationInput(executorPollMs, 3000))
+      }
+    }
+
+    void loop()
+
+    return () => {
+      cancelled = true
+      executorRunningRef.current = false
+    }
+  }, [executorPollMs, executorRunning, runExecutorCycle])
 
   const visibleTasks = data?.runtime.tasks.filter((task) => {
     if (taskQueueFilter === '__all__') return true
@@ -385,6 +565,62 @@ export default function MonitorPage() {
                     <div className="mt-1 text-lg font-semibold">worker</div>
                   </div>
                 </div>
+                <div className="grid grid-cols-1 xl:grid-cols-4 gap-4">
+                  <div className="space-y-2">
+                    <div className="text-sm font-medium">轮询间隔(ms)</div>
+                    <Input
+                      value={executorPollMs}
+                      onChange={(event) => setExecutorPollMs(event.target.value)}
+                      inputMode="numeric"
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <div className="text-sm font-medium">模拟处理时长(ms)</div>
+                    <Input
+                      value={executorProcessMs}
+                      onChange={(event) => setExecutorProcessMs(event.target.value)}
+                      inputMode="numeric"
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <div className="text-sm font-medium">心跳间隔(ms)</div>
+                    <Input
+                      value={executorHeartbeatMs}
+                      onChange={(event) => setExecutorHeartbeatMs(event.target.value)}
+                      inputMode="numeric"
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <div className="text-sm font-medium">执行模式</div>
+                    <Select
+                      value={executorMode}
+                      onValueChange={(value) => setExecutorMode(value as ExecutorMode)}
+                    >
+                      <SelectTrigger>
+                        <SelectValue placeholder="选择执行模式" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="payload">优先读 payload</SelectItem>
+                        <SelectItem value="success">强制完成</SelectItem>
+                        <SelectItem value="fail">强制失败</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                </div>
+                <div className="rounded-md bg-background p-3 text-sm space-y-1">
+                  <div className="flex items-center justify-between gap-3">
+                    <span className="text-muted-foreground">执行器状态</span>
+                    <span className={`rounded-full px-3 py-1 text-xs font-medium ${
+                      executorRunning ? 'bg-emerald-500/10 text-emerald-500' : 'bg-muted text-muted-foreground'
+                    }`}>
+                      {executorRunning ? '运行中' : '已停止'}
+                    </span>
+                  </div>
+                  <div>{executorStatus}</div>
+                  <div className="text-muted-foreground break-all">
+                    当前任务 {executorActiveTaskId || '无'}
+                  </div>
+                </div>
                 {(taskActionMessage || taskActionError) && (
                   <div className={`rounded-md px-3 py-2 text-sm ${
                     taskActionError ? 'bg-red-500/10 text-red-500' : 'bg-emerald-500/10 text-emerald-500'
@@ -395,9 +631,59 @@ export default function MonitorPage() {
                 <div className="flex flex-wrap gap-3">
                   <Button
                     onClick={() => claimNextTask(selectedQueue)}
-                    disabled={!executorId.trim() || !selectedQueue.trim() || Boolean(taskActionKey)}
+                    disabled={!executorId.trim() || !selectedQueue.trim() || Boolean(taskActionKey) || executorRunning}
                   >
                     claim next
+                  </Button>
+                  <Button
+                    onClick={() => {
+                      setTaskActionError(null)
+                      setTaskActionMessage(null)
+                      setExecutorRunning(true)
+                    }}
+                    disabled={!executorId.trim() || !selectedQueue.trim() || executorRunning}
+                  >
+                    启动执行器
+                  </Button>
+                  <Button
+                    variant="outline"
+                    onClick={() => setExecutorRunning(false)}
+                    disabled={!executorRunning}
+                  >
+                    停止执行器
+                  </Button>
+                  <Button
+                    variant="outline"
+                    onClick={async () => {
+                      try {
+                        const holderId = executorId.trim()
+                        const queueName = selectedQueue.trim()
+                        if (!holderId || !queueName) {
+                          throw new Error('请先填写执行器 ID 和默认队列')
+                        }
+                        setTaskActionError(null)
+                        setTaskActionMessage(null)
+                        const data = await postTaskRequest<{
+                          expired: number
+                          requeuedTaskIds: string[]
+                          failedTaskIds: string[]
+                        }>('/api/tasks/recover-expired', {
+                          queueName,
+                          actorId: holderId,
+                          actorType: 'worker',
+                          reason: `lease expired while monitored by ${holderId}`,
+                        })
+                        setTaskActionMessage(
+                          `已恢复 ${data.expired} 个过期任务，回队 ${data.requeuedTaskIds.length} 个，失败 ${data.failedTaskIds.length} 个`
+                        )
+                        await syncTaskViews()
+                      } catch (error) {
+                        setTaskActionError(error instanceof Error ? error.message : String(error))
+                      }
+                    }}
+                    disabled={Boolean(taskActionKey)}
+                  >
+                    恢复过期任务
                   </Button>
                   <Button
                     variant="outline"
@@ -517,6 +803,7 @@ export default function MonitorPage() {
                     <TaskItem
                       key={task.id}
                       task={task}
+                      isExecutorActive={task.id === executorActiveTaskId}
                       actionKey={taskActionKey}
                       onOpenDetail={() => setDetailTaskId(task.id)}
                       onRelease={releaseTask}
@@ -963,6 +1250,7 @@ function SessionItem({ session }: { session: SessionBindingView }) {
 
 function TaskItem({
   task,
+  isExecutorActive,
   actionKey,
   onOpenDetail,
   onRelease,
@@ -970,6 +1258,7 @@ function TaskItem({
   onFail,
 }: {
   task: TaskRuntimeView
+  isExecutorActive: boolean
   actionKey: string | null
   onOpenDetail: () => void
   onRelease: (task: TaskRuntimeView) => Promise<void>
@@ -987,6 +1276,11 @@ function TaskItem({
         <div className="min-w-0">
           <div className="flex items-center gap-2 flex-wrap">
             <TaskStatusTag status={task.status} />
+            {isExecutorActive && (
+              <span className="rounded-full px-2 py-1 text-xs font-medium bg-blue-500/10 text-blue-500">
+                executor active
+              </span>
+            )}
             <span className="font-medium break-all">{task.title}</span>
             {task.kind && (
               <span className="text-sm text-muted-foreground">{task.kind}</span>
@@ -1114,4 +1408,32 @@ function TaskStatusTag({ status }: { status: TaskRuntimeView['status'] }) {
        status === 'cancelled' ? '已取消' : '待处理'}
     </span>
   )
+}
+
+function normalizeDurationInput(value: string, fallback: number): number {
+  const parsed = Number.parseInt(value, 10)
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback
+  return parsed
+}
+
+function waitMs(ms: number) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms))
+}
+
+function resolveExecutorOutcome(task: TaskRecord, mode: ExecutorMode): 'success' | 'fail' {
+  if (mode === 'success') return 'success'
+  if (mode === 'fail') return 'fail'
+
+  const outcome = task.payload && typeof task.payload.mockOutcome === 'string'
+    ? task.payload.mockOutcome
+    : task.metadata && typeof task.metadata.mockOutcome === 'string'
+      ? task.metadata.mockOutcome
+      : undefined
+
+  return outcome === 'fail' ? 'fail' : 'success'
+}
+
+function buildExecutorSummary(task: TaskRecord, executorId: string, status: 'completed' | 'failed') {
+  const prefix = status === 'completed' ? 'completed' : 'failed'
+  return `${task.title} ${prefix} by ${executorId}`
 }

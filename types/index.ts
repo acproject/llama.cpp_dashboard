@@ -261,8 +261,10 @@ export type TaskEventType =
   | 'status_changed'
   | 'child_added'
   | 'leased'
+  | 'heartbeat'
   | 'lease_released'
   | 'result_set'
+  | 'timed_out'
   | 'completed'
   | 'failed'
   | 'cancelled'
@@ -323,6 +325,18 @@ export interface TaskResult {
   output?: unknown
   metadata?: Record<string, unknown>
   updatedAt: number
+}
+
+export interface TaskEvidenceRecord {
+  id: string
+  taskId: string
+  kind: string
+  title?: string
+  content?: string
+  source?: string
+  uri?: string
+  metadata?: Record<string, unknown>
+  createdAt: number
 }
 
 export interface TaskQueueStats {

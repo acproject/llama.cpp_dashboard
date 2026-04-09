@@ -1,6 +1,6 @@
-import { deleteKey, getJson, getJsonList, KEYS, keys, pushJsonList, setJson } from '@/lib/minimemory'
+import { deleteKey, getJson, getJsonList, KEYS, keys, pushJsonList, setJson, tagadd } from '@/lib/minimemory'
 import { generateId } from '@/lib/utils'
-import { TaskClaimResult, TaskEvent, TaskEventType, TaskLease, TaskPriority, TaskQueueStats, TaskRecord, TaskResult, TaskRuntimeView, TaskStatus } from '@/types'
+import { TaskClaimResult, TaskEvent, TaskEventType, TaskEvidenceRecord, TaskLease, TaskPriority, TaskQueueStats, TaskRecord, TaskResult, TaskRuntimeView, TaskStatus } from '@/types'
 
 const TASK_TTL_MS = 7 * 24 * 60 * 60 * 1000
 const TASK_EVENT_LIMIT = 200
@@ -590,8 +590,190 @@ export async function releaseTaskLease(taskId: string, input: unknown): Promise<
   return existing
 }
 
+export async function heartbeatTaskLease(taskId: string, input: unknown): Promise<TaskLease> {
+  const task = await getTask(taskId)
+  if (!task) throw new Error(`Task not found: ${taskId}`)
+
+  const existing = await getTaskLease(taskId)
+  if (!existing) {
+    throw new Error(`Task lease not found: ${taskId}`)
+  }
+
+  const body = isRecord(input) ? input : {}
+  const holderId = normalizeOptionalString(body.holderId)
+  if (!holderId) {
+    throw new Error('holderId is required')
+  }
+  if (existing.holderId !== holderId) {
+    throw new Error(`Task lease is held by ${existing.holderId}`)
+  }
+
+  const now = Date.now()
+  const ttlMs = normalizeLeaseMs(body.ttlMs)
+  const lease: TaskLease = {
+    ...existing,
+    heartbeatAt: now,
+    expiresAt: now + ttlMs,
+    metadata: isRecord(body.metadata)
+      ? { ...(existing.metadata || {}), ...body.metadata }
+      : existing.metadata,
+  }
+
+  await setJson(KEYS.TASK_LEASE(taskId), lease, ttlMs)
+  await setJson(KEYS.TASK(taskId), {
+    ...task,
+    status: isTerminalTaskStatus(task.status) ? task.status : 'running',
+    updatedAt: now,
+    claimedAt: task.claimedAt || existing.acquiredAt,
+    startedAt: task.startedAt || existing.acquiredAt,
+  }, TASK_TTL_MS)
+  await appendTaskEvent(taskId, {
+    type: 'heartbeat',
+    detail: `lease heartbeat from ${holderId}`,
+    actorId: holderId,
+    actorType: existing.holderType,
+    metadata: { expiresAt: lease.expiresAt },
+  })
+
+  return lease
+}
+
+export async function recoverExpiredTasks(input: unknown): Promise<{
+  scanned: number
+  expired: number
+  requeuedTaskIds: string[]
+  failedTaskIds: string[]
+  releasedTaskIds: string[]
+}> {
+  const body = isRecord(input) ? input : {}
+  const queueName = normalizeOptionalString(body.queueName)
+  const actorId = normalizeOptionalString(body.actorId) || 'system'
+  const actorType = normalizeOptionalString(body.actorType) || 'system'
+  const reason = normalizeOptionalString(body.reason) || 'task lease expired'
+  const now = Date.now()
+  const tasks = await listTasks(queueName ? { queueName, limit: 500 } : { limit: 500 })
+  const taskEntries = await Promise.all(
+    tasks.map(async (task) => ({
+      task,
+      lease: await getTaskLease(task.id),
+    }))
+  )
+  const expiredEntries = taskEntries.filter(({ lease }) => Boolean(lease && lease.expiresAt <= now))
+  const requeuedTaskIds: string[] = []
+  const failedTaskIds: string[] = []
+  const releasedTaskIds: string[] = []
+
+  for (const entry of expiredEntries) {
+    const { task, lease } = entry
+    if (!lease) continue
+
+    await deleteKey(KEYS.TASK_LEASE(task.id))
+    await appendTaskEvent(task.id, {
+      type: 'timed_out',
+      detail: reason,
+      actorId,
+      actorType,
+      metadata: {
+        expiredAt: lease.expiresAt,
+        holderId: lease.holderId,
+        holderType: lease.holderType,
+      },
+    })
+
+    if (task.status === 'running') {
+      const canRetry = Boolean(task.queueName) && task.retryCount < task.maxRetries
+      if (canRetry) {
+        const next = await updateTask(task.id, {
+          status: 'queued',
+          retryCount: task.retryCount + 1,
+          error: reason,
+        })
+        if (next?.queueName) {
+          requeuedTaskIds.push(task.id)
+          await appendTaskEvent(task.id, {
+            type: 'updated',
+            detail: `task requeued after timeout in ${next.queueName}`,
+            actorId,
+            actorType,
+            metadata: {
+              queueName: next.queueName,
+              retryCount: next.retryCount,
+            },
+          })
+          continue
+        }
+      }
+
+      await updateTask(task.id, {
+        status: 'failed',
+        error: reason,
+        completedAt: now,
+      })
+      failedTaskIds.push(task.id)
+      continue
+    }
+
+    releasedTaskIds.push(task.id)
+  }
+
+  return {
+    scanned: tasks.length,
+    expired: expiredEntries.length,
+    requeuedTaskIds,
+    failedTaskIds,
+    releasedTaskIds,
+  }
+}
+
 export async function getTaskResult(taskId: string): Promise<TaskResult | null> {
   return await getJson<TaskResult>(KEYS.TASK_RESULT(taskId))
+}
+
+export async function listTaskEvidence(taskId: string): Promise<TaskEvidenceRecord[]> {
+  const ids = await getJsonList<string>(KEYS.TASK_EVIDENCES(taskId), 0, 199)
+  const records = await Promise.all(
+    ids.map((id) => getJson<TaskEvidenceRecord>(KEYS.TASK_EVIDENCE(taskId, id)))
+  )
+  return records.filter((record): record is TaskEvidenceRecord => Boolean(record))
+}
+
+export async function addTaskEvidence(taskId: string, input: unknown): Promise<TaskEvidenceRecord> {
+  const task = await getTask(taskId)
+  if (!task) throw new Error(`Task not found: ${taskId}`)
+
+  const body = isRecord(input) ? input : {}
+  const now = Date.now()
+  const record: TaskEvidenceRecord = {
+    id: generateId(),
+    taskId,
+    kind: normalizeOptionalString(body.kind) || 'artifact',
+    title: normalizeOptionalString(body.title),
+    content: normalizeOptionalString(body.content),
+    source: normalizeOptionalString(body.source),
+    uri: normalizeOptionalString(body.uri),
+    metadata: isRecord(body.metadata) ? body.metadata : undefined,
+    createdAt: now,
+  }
+
+  await setJson(KEYS.TASK_EVIDENCE(taskId, record.id), record, TASK_TTL_MS)
+  await pushJsonList(KEYS.TASK_EVIDENCES(taskId), record.id, { maxLength: 200, ttlMs: TASK_TTL_MS })
+  await tagadd(
+    KEYS.TASK_EVIDENCE(taskId, record.id),
+    'task-evidence',
+    `task:${taskId}`,
+    `kind:${record.kind}`
+  )
+  await appendTaskEvent(taskId, {
+    type: 'updated',
+    detail: `task evidence added: ${record.kind}`,
+    metadata: {
+      evidenceId: record.id,
+      kind: record.kind,
+      title: record.title || null,
+    },
+  })
+
+  return record
 }
 
 export async function setTaskResult(taskId: string, input: unknown): Promise<TaskResult> {
