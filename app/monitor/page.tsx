@@ -1424,8 +1424,11 @@ function resolveExecutorOutcome(task: TaskRecord, mode: ExecutorMode): 'success'
   if (mode === 'success') return 'success'
   if (mode === 'fail') return 'fail'
 
-  const outcome = task.payload && typeof task.payload.mockOutcome === 'string'
-    ? task.payload.mockOutcome
+  const payload = task.payload && typeof task.payload === 'object' && !Array.isArray(task.payload)
+    ? task.payload as Record<string, unknown>
+    : null
+  const outcome = payload && typeof payload.mockOutcome === 'string'
+    ? payload.mockOutcome
     : task.metadata && typeof task.metadata.mockOutcome === 'string'
       ? task.metadata.mockOutcome
       : undefined

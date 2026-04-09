@@ -104,7 +104,286 @@
 
 这意味着它已经不仅是请求代理，也开始具备“任务控制面”的雏形。
 
-### 2.7 统一监控面板
+为了让这条链路更容易直接落地，下面给出几组可以直接拿来创建任务的真实 payload 示例。
+
+#### 2.6.1 `agent.chat`
+
+适合把一个对话请求明确交给某个 Agent 处理：
+
+```json
+{
+  "title": "总结最近的发布变更",
+  "kind": "agent.chat",
+  "status": "queued",
+  "queueName": "default",
+  "requestedAgentId": "release-assistant",
+  "payload": {
+    "agentId": "release-assistant",
+    "model": "qwen2.5-coder",
+    "routePath": "/api/openai/v1/chat/completions",
+    "messages": [
+      {
+        "role": "system",
+        "content": "你是发布助手，负责生成简明的中文发布摘要。"
+      },
+      {
+        "role": "user",
+        "content": "请基于最近三次提交整理一份发布说明。"
+      }
+    ]
+  }
+}
+```
+
+#### 2.6.2 `service.embedding`
+
+适合把一段文本或一组文本送到指定 embedding service，并把结果继续写回任务结果和证据链路：
+
+```json
+{
+  "title": "为需求文档生成向量",
+  "kind": "service.embedding",
+  "status": "queued",
+  "queueName": "embedding",
+  "payload": {
+    "serviceId": "local-embedding-service",
+    "servicePath": "/v1/embeddings",
+    "model": "bge-m3",
+    "input": [
+      "项目需要支持 service/tool 流式输出。",
+      "任务证据需要进入统一 RAG 与图谱链路。"
+    ]
+  }
+}
+```
+
+#### 2.6.3 `tool.http`
+
+适合调用外部 HTTP 工具或内部 API；如果目标接口支持流式响应，可以直接打开 `stream`：
+
+```json
+{
+  "title": "拉取增量构建日志",
+  "kind": "tool.http",
+  "status": "queued",
+  "queueName": "tools",
+  "payload": {
+    "baseUrl": "http://127.0.0.1:8080",
+    "path": "/api/build/logs/stream",
+    "method": "GET",
+    "query": {
+      "runId": "run_123",
+      "follow": true
+    },
+    "headers": {
+      "x-tool-source": "task-worker"
+    },
+    "stream": true
+  }
+}
+```
+
+#### 2.6.4 `service.chat`
+
+适合绕过 Agent 选路，直接把请求交给某个模型服务，并开启增量事件回写：
+
+```json
+{
+  "title": "直接调用服务做代码评审",
+  "kind": "service.chat",
+  "status": "queued",
+  "queueName": "review",
+  "payload": {
+    "serviceId": "llama-coder-01",
+    "servicePath": "/v1/chat/completions",
+    "model": "qwen2.5-coder",
+    "stream": true,
+    "messages": [
+      {
+        "role": "system",
+        "content": "你是代码评审助手。"
+      },
+      {
+        "role": "user",
+        "content": "请检查 task worker 的流式处理实现是否有边界问题。"
+      }
+    ]
+  }
+}
+```
+
+这些示例对应当前已经收紧后的协议面：
+
+- `kind` 建议使用 `agent.chat / agent.completion / service.chat / service.completion / service.embedding / tool.http`
+- `payload` 必须是对象
+- `service.embedding` 必须提供 `serviceId` 和 `input`
+- `tool.http` 至少提供 `url` 或 `path`
+- `service.* / tool.http` 在 `stream: true` 时会写入增量事件和部分结果
+
+#### 2.6.5 可直接用 `curl` 创建任务
+
+如果本地控制台跑在 `http://127.0.0.1:3000`，可以直接调用 `POST /api/tasks` 创建任务。
+
+创建后如果 `status` 是 `queued` 且带了 `queueName`，任务就可以被 worker 继续认领执行。
+
+`agent.chat`：
+
+```bash
+curl -X POST http://127.0.0.1:3000/api/tasks \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "title": "总结最近的发布变更",
+    "kind": "agent.chat",
+    "status": "queued",
+    "queueName": "default",
+    "requestedAgentId": "release-assistant",
+    "payload": {
+      "agentId": "release-assistant",
+      "model": "qwen2.5-coder",
+      "routePath": "/api/openai/v1/chat/completions",
+      "messages": [
+        {
+          "role": "system",
+          "content": "你是发布助手，负责生成简明的中文发布摘要。"
+        },
+        {
+          "role": "user",
+          "content": "请基于最近三次提交整理一份发布说明。"
+        }
+      ]
+    }
+  }'
+```
+
+`service.embedding`：
+
+```bash
+curl -X POST http://127.0.0.1:3000/api/tasks \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "title": "为需求文档生成向量",
+    "kind": "service.embedding",
+    "status": "queued",
+    "queueName": "embedding",
+    "payload": {
+      "serviceId": "local-embedding-service",
+      "servicePath": "/v1/embeddings",
+      "model": "bge-m3",
+      "input": [
+        "项目需要支持 service/tool 流式输出。",
+        "任务证据需要进入统一 RAG 与图谱链路。"
+      ]
+    }
+  }'
+```
+
+`tool.http`：
+
+```bash
+curl -X POST http://127.0.0.1:3000/api/tasks \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "title": "拉取增量构建日志",
+    "kind": "tool.http",
+    "status": "queued",
+    "queueName": "tools",
+    "payload": {
+      "baseUrl": "http://127.0.0.1:8080",
+      "path": "/api/build/logs/stream",
+      "method": "GET",
+      "query": {
+        "runId": "run_123",
+        "follow": true
+      },
+      "headers": {
+        "x-tool-source": "task-worker"
+      },
+      "stream": true
+    }
+  }'
+```
+
+`service.chat`：
+
+```bash
+curl -X POST http://127.0.0.1:3000/api/tasks \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "title": "直接调用服务做代码评审",
+    "kind": "service.chat",
+    "status": "queued",
+    "queueName": "review",
+    "payload": {
+      "serviceId": "llama-coder-01",
+      "servicePath": "/v1/chat/completions",
+      "model": "qwen2.5-coder",
+      "stream": true,
+      "messages": [
+        {
+          "role": "system",
+          "content": "你是代码评审助手。"
+        },
+        {
+          "role": "user",
+          "content": "请检查 task worker 的流式处理实现是否有边界问题。"
+        }
+      ]
+    }
+  }'
+```
+
+创建成功后，通常可以继续这样检查任务状态：
+
+```bash
+curl http://127.0.0.1:3000/api/tasks
+curl http://127.0.0.1:3000/api/tasks/<taskId>
+curl http://127.0.0.1:3000/api/tasks/<taskId>/events
+curl http://127.0.0.1:3000/api/tasks/<taskId>/result
+```
+
+#### 2.6.6 任务创建后到 worker 消费的完整链路
+
+一次任务从创建到产出结果，当前大致会经过下面这条链路：
+
+1. 客户端调用 `POST /api/tasks`，写入任务基础信息、`kind`、`queueName` 和 `payload`
+2. 服务端在入库前规范化 `task.kind`，并按 kind 校验 `payload` 是否满足最小协议
+3. 如果任务以 `queued` 状态进入队列，worker 会按 `queueName` 轮询并认领任务
+4. worker 根据 `kind` 选择对应 handler，比如 `agent.chat`、`service.embedding`、`tool.http`
+5. handler 执行过程中会持续追加任务事件，流式任务还会写入 `stream_started / stream_delta / stream_completed`
+6. handler 完成后写入任务结果；如果有 evidence，也会继续接入任务证据归档以及图谱 / RAG 链路
+7. 监控页和任务详情接口可以继续读取任务状态、事件流、最终结果以及关联证据
+
+如果你在本地排查一条任务是否跑通，最常用的观察面通常就是这四个接口：
+
+```bash
+curl http://127.0.0.1:3000/api/tasks/<taskId>
+curl http://127.0.0.1:3000/api/tasks/<taskId>/events
+curl http://127.0.0.1:3000/api/tasks/<taskId>/result
+curl http://127.0.0.1:3000/api/rag/search?q=<关键词>
+```
+
+#### 2.6.7 每种 kind 的最小必填字段
+
+下表适合在手工构造任务或排查 400/422 参数错误时快速对照：
+
+| kind | 顶层建议字段 | payload 最小必填字段 | 常见可选字段 |
+| --- | --- | --- | --- |
+| `agent.chat` | `title` `status` `queueName` | `messages` | `agentId` `model` `routePath` `request` |
+| `agent.completion` | `title` `status` `queueName` | `prompt` | `agentId` `model` `routePath` `request` |
+| `service.chat` | `title` `status` `queueName` | `serviceId` `messages` | `servicePath` `model` `stream` `request` |
+| `service.completion` | `title` `status` `queueName` | `serviceId` `prompt` | `servicePath` `model` `stream` `request` |
+| `service.embedding` | `title` `status` `queueName` | `serviceId` `input` | `servicePath` `model` |
+| `tool.http` | `title` `status` `queueName` | `url` 或 `path` | `baseUrl` `method` `headers` `query` `body` `stream` |
+
+额外约束也值得一起记住：
+
+- 所有任务的 `payload` 都必须是对象
+- `stream` 只对支持流式处理的 kind 有意义，当前主要是 `service.*` 和 `tool.http`
+- `tool.http` 如果只传 `path`，通常还需要配合 `baseUrl`
+- `service.embedding` 的 `input` 可以是一段文本，也可以是字符串数组
+- 旧的粗粒度 kind 还能兼容，但新任务建议统一写成细粒度 kind
+
+
 
 监控页当前已经能同时看到多类运行信息：
 

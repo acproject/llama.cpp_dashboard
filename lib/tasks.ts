@@ -1,6 +1,7 @@
 import { deleteKey, getJson, getJsonList, KEYS, keys, pushJsonList, setJson, tagadd } from '@/lib/minimemory'
+import { indexTaskEvidenceInRag } from '@/lib/rag'
 import { generateId } from '@/lib/utils'
-import { TaskClaimResult, TaskEvent, TaskEventType, TaskEvidenceRecord, TaskLease, TaskPriority, TaskQueueStats, TaskRecord, TaskResult, TaskRuntimeView, TaskStatus } from '@/types'
+import { TaskClaimResult, TaskEvent, TaskEventType, TaskEvidenceRecord, TaskKind, TaskLease, TaskPayload, TaskPriority, TaskQueueStats, TaskRecord, TaskResult, TaskRuntimeView, TaskStatus } from '@/types'
 
 const TASK_TTL_MS = 7 * 24 * 60 * 60 * 1000
 const TASK_EVENT_LIMIT = 200
@@ -773,6 +774,43 @@ export async function addTaskEvidence(taskId: string, input: unknown): Promise<T
     },
   })
 
+  if (shouldIndexTaskEvidence(task, record)) {
+    try {
+      const indexed = await indexTaskEvidenceInRag(task, record)
+      record.metadata = {
+        ...(record.metadata || {}),
+        rag: {
+          collectionId: indexed.collection.id,
+          documentId: indexed.document.id,
+        },
+      }
+      await setJson(KEYS.TASK_EVIDENCE(taskId, record.id), record, TASK_TTL_MS)
+      await appendTaskEvent(taskId, {
+        type: 'evidence_indexed',
+        detail: `task evidence indexed into rag: ${indexed.collection.name}`,
+        metadata: {
+          evidenceId: record.id,
+          collectionId: indexed.collection.id,
+          documentId: indexed.document.id,
+        },
+      })
+    } catch (error) {
+      record.metadata = {
+        ...(record.metadata || {}),
+        ragError: error instanceof Error ? error.message : String(error),
+      }
+      await setJson(KEYS.TASK_EVIDENCE(taskId, record.id), record, TASK_TTL_MS)
+      await appendTaskEvent(taskId, {
+        type: 'updated',
+        detail: `task evidence rag indexing failed: ${record.kind}`,
+        metadata: {
+          evidenceId: record.id,
+          error: error instanceof Error ? error.message : String(error),
+        },
+      })
+    }
+  }
+
   return record
 }
 
@@ -864,11 +902,13 @@ async function unlinkChildTask(parentTaskId: string, childTaskId: string) {
 
 function normalizeTaskInput(input: unknown): TaskInput {
   const body = isRecord(input) ? input : {}
+  const kind = normalizeTaskKind(body.kind)
+  const hasPayload = Object.prototype.hasOwnProperty.call(body, 'payload')
 
   return {
     title: normalizeOptionalString(body.title),
     description: normalizeOptionalString(body.description),
-    kind: normalizeOptionalString(body.kind),
+    kind,
     status: normalizeTaskStatus(body.status),
     priority: normalizeTaskPriority(body.priority),
     parentTaskId: normalizeOptionalString(body.parentTaskId),
@@ -881,12 +921,227 @@ function normalizeTaskInput(input: unknown): TaskInput {
     retryCount: normalizeOptionalNumber(body.retryCount),
     maxRetries: normalizeOptionalNumber(body.maxRetries),
     dependsOnTaskIds: Array.isArray(body.dependsOnTaskIds) ? normalizeStringArray(body.dependsOnTaskIds) : undefined,
-    payload: isRecord(body.payload) ? body.payload : undefined,
+    payload: hasPayload ? normalizeTaskPayload(kind, body.payload) : undefined,
     metadata: isRecord(body.metadata) ? body.metadata : undefined,
     error: normalizeOptionalString(body.error),
     claimedAt: normalizeOptionalNumber(body.claimedAt),
     startedAt: normalizeOptionalNumber(body.startedAt),
     completedAt: normalizeOptionalNumber(body.completedAt),
+  }
+}
+
+function normalizeTaskKind(value: unknown): TaskKind | undefined {
+  const normalized = normalizeOptionalString(value)
+  if (!normalized) return undefined
+
+  const resolved = isOneOf<TaskKind>(normalized, [
+    'mock',
+    'agent.chat',
+    'agent.completion',
+    'service.chat',
+    'service.completion',
+    'service.embedding',
+    'tool.http',
+  ]) || inferLegacyTaskKind(normalized)
+
+  if (!resolved) {
+    throw new Error(`Unsupported task kind: ${normalized}`)
+  }
+
+  return resolved
+}
+
+function inferLegacyTaskKind(kind: string): TaskKind | undefined {
+  if (kind === 'agent') return 'agent.chat'
+  if (kind === 'service') return 'service.chat'
+  if (kind === 'tool') return 'tool.http'
+  return undefined
+}
+
+function normalizeTaskPayload(kind: TaskKind | undefined, payload: unknown): TaskPayload | undefined {
+  if (typeof payload === 'undefined') return undefined
+  if (!isRecord(payload)) {
+    if (kind && kind !== 'mock') {
+      throw new Error(`${kind} payload 必须是对象`)
+    }
+    return undefined
+  }
+
+  switch (kind) {
+    case 'agent.chat':
+      return normalizeAgentChatPayload(payload)
+    case 'agent.completion':
+      return normalizeAgentCompletionPayload(payload)
+    case 'service.chat':
+      return normalizeServiceChatPayload(payload)
+    case 'service.completion':
+      return normalizeServiceCompletionPayload(payload)
+    case 'service.embedding':
+      return normalizeServiceEmbeddingPayload(payload)
+    case 'tool.http':
+      return normalizeToolHttpPayload(payload)
+    default:
+      return payload
+  }
+}
+
+function normalizeAgentChatPayload(payload: Record<string, unknown>): TaskPayload {
+  const messages = Array.isArray(payload.messages)
+    ? payload.messages
+    : typeof payload.prompt === 'string' && payload.prompt.trim()
+      ? [{ role: 'user', content: payload.prompt.trim() }]
+      : []
+
+  if (messages.length === 0) {
+    throw new Error('agent.chat payload.messages 不能为空')
+  }
+
+  return {
+    agentId: normalizeOptionalString(payload.agentId) || normalizeOptionalString(payload.agent_id),
+    model: normalizeOptionalString(payload.model),
+    path: normalizeOptionalString(payload.path),
+    routePath: normalizeOptionalString(payload.routePath),
+    messages,
+    stream: normalizeOptionalBoolean(payload.stream),
+    request: isRecord(payload.request)
+      ? payload.request
+      : isRecord(payload.body)
+        ? payload.body
+        : undefined,
+  }
+}
+
+function normalizeAgentCompletionPayload(payload: Record<string, unknown>): TaskPayload {
+  const prompt = normalizeOptionalString(payload.prompt)
+  if (!prompt) {
+    throw new Error('agent.completion payload.prompt 不能为空')
+  }
+
+  return {
+    agentId: normalizeOptionalString(payload.agentId) || normalizeOptionalString(payload.agent_id),
+    model: normalizeOptionalString(payload.model),
+    path: normalizeOptionalString(payload.path),
+    routePath: normalizeOptionalString(payload.routePath),
+    prompt,
+    stream: normalizeOptionalBoolean(payload.stream),
+    request: isRecord(payload.request)
+      ? payload.request
+      : isRecord(payload.body)
+        ? payload.body
+        : undefined,
+  }
+}
+
+function normalizeServiceChatPayload(payload: Record<string, unknown>): TaskPayload {
+  const serviceId =
+    normalizeOptionalString(payload.serviceId) ||
+    normalizeOptionalString(payload.service_id) ||
+    normalizeOptionalString(payload.targetServiceId)
+  const messages = Array.isArray(payload.messages)
+    ? payload.messages
+    : typeof payload.prompt === 'string' && payload.prompt.trim()
+      ? [{ role: 'user', content: payload.prompt.trim() }]
+      : []
+
+  if (!serviceId) {
+    throw new Error('service.chat payload.serviceId 不能为空')
+  }
+  if (messages.length === 0) {
+    throw new Error('service.chat payload.messages 不能为空')
+  }
+
+  return {
+    serviceId,
+    model: normalizeOptionalString(payload.model),
+    path: normalizeOptionalString(payload.path),
+    servicePath: normalizeOptionalString(payload.servicePath),
+    messages,
+    stream: normalizeOptionalBoolean(payload.stream),
+    request: isRecord(payload.request)
+      ? payload.request
+      : isRecord(payload.body)
+        ? payload.body
+        : undefined,
+  }
+}
+
+function normalizeServiceCompletionPayload(payload: Record<string, unknown>): TaskPayload {
+  const serviceId =
+    normalizeOptionalString(payload.serviceId) ||
+    normalizeOptionalString(payload.service_id) ||
+    normalizeOptionalString(payload.targetServiceId)
+  const prompt = normalizeOptionalString(payload.prompt)
+
+  if (!serviceId) {
+    throw new Error('service.completion payload.serviceId 不能为空')
+  }
+  if (!prompt) {
+    throw new Error('service.completion payload.prompt 不能为空')
+  }
+
+  return {
+    serviceId,
+    model: normalizeOptionalString(payload.model),
+    path: normalizeOptionalString(payload.path),
+    servicePath: normalizeOptionalString(payload.servicePath),
+    prompt,
+    stream: normalizeOptionalBoolean(payload.stream),
+    request: isRecord(payload.request)
+      ? payload.request
+      : isRecord(payload.body)
+        ? payload.body
+        : undefined,
+  }
+}
+
+function normalizeServiceEmbeddingPayload(payload: Record<string, unknown>): TaskPayload {
+  const serviceId =
+    normalizeOptionalString(payload.serviceId) ||
+    normalizeOptionalString(payload.service_id) ||
+    normalizeOptionalString(payload.targetServiceId)
+  const input = Array.isArray(payload.input)
+    ? payload.input.filter((item): item is string => typeof item === 'string' && Boolean(item.trim()))
+    : normalizeOptionalString(payload.input)
+
+  if (!serviceId) {
+    throw new Error('service.embedding payload.serviceId 不能为空')
+  }
+  if (!input || (Array.isArray(input) && input.length === 0)) {
+    throw new Error('service.embedding payload.input 不能为空')
+  }
+
+  return {
+    serviceId,
+    model: normalizeOptionalString(payload.model),
+    path: normalizeOptionalString(payload.path),
+    servicePath: normalizeOptionalString(payload.servicePath),
+    input,
+    request: isRecord(payload.request)
+      ? payload.request
+      : isRecord(payload.body)
+        ? payload.body
+        : undefined,
+  }
+}
+
+function normalizeToolHttpPayload(payload: Record<string, unknown>): TaskPayload {
+  const url = normalizeOptionalString(payload.url)
+  const path = normalizeOptionalString(payload.path)
+
+  if (!url && !path) {
+    throw new Error('tool.http payload.url 或 payload.path 至少提供一个')
+  }
+
+  return {
+    url,
+    path,
+    baseUrl: normalizeOptionalString(payload.baseUrl),
+    method: normalizeOptionalString(payload.method),
+    headers: normalizeStringRecord(payload.headers),
+    query: normalizePrimitiveRecord(payload.query),
+    body: payload.body,
+    stream: normalizeOptionalBoolean(payload.stream),
+    unwrapSuccessEnvelope: normalizeOptionalBoolean(payload.unwrapSuccessEnvelope),
   }
 }
 
@@ -923,12 +1178,56 @@ function normalizeOptionalNumber(value: unknown): number | undefined {
   return value
 }
 
+function normalizeOptionalBoolean(value: unknown): boolean | undefined {
+  return typeof value === 'boolean' ? value : undefined
+}
+
 function normalizeStringArray(values: unknown[]): string[] {
   return Array.from(new Set(
     values
       .map((value) => (typeof value === 'string' ? value.trim() : ''))
       .filter(Boolean)
   ))
+}
+
+function normalizeStringRecord(value: unknown): Record<string, string> | undefined {
+  if (!isRecord(value)) return undefined
+
+  const entries = Object.entries(value)
+    .map(([key, entry]) => [key, normalizeOptionalString(entry)] as const)
+    .filter((entry): entry is readonly [string, string] => Boolean(entry[1]))
+
+  return entries.length > 0 ? Object.fromEntries(entries) : undefined
+}
+
+function normalizePrimitiveRecord(value: unknown): Record<string, string | number | boolean> | undefined {
+  if (!isRecord(value)) return undefined
+
+  const entries = Object.entries(value)
+    .filter((entry): entry is [string, string | number | boolean] => {
+      const current = entry[1]
+      return typeof current === 'string' || typeof current === 'number' || typeof current === 'boolean'
+    })
+
+  return entries.length > 0 ? Object.fromEntries(entries) : undefined
+}
+
+function shouldIndexTaskEvidence(task: TaskRecord, record: TaskEvidenceRecord): boolean {
+  if (!record.content && !record.metadata) {
+    return false
+  }
+
+  if (process.env.TASK_EVIDENCE_RAG_ENABLED === 'false') {
+    return false
+  }
+
+  const taskMetadata = isRecord(task.metadata) ? task.metadata : {}
+  const ragConfig = isRecord(taskMetadata.evidenceRag) ? taskMetadata.evidenceRag : {}
+  if (ragConfig.enabled === false) {
+    return false
+  }
+
+  return true
 }
 
 function isTerminalTaskStatus(status: TaskStatus): boolean {

@@ -255,6 +255,85 @@ export type TaskStatus = 'pending' | 'queued' | 'running' | 'completed' | 'faile
 
 export type TaskPriority = 'low' | 'normal' | 'high' | 'urgent'
 
+export type TaskKind =
+  | 'mock'
+  | 'agent.chat'
+  | 'agent.completion'
+  | 'service.chat'
+  | 'service.completion'
+  | 'service.embedding'
+  | 'tool.http'
+
+export interface AgentChatTaskPayload {
+  agentId?: string
+  model?: string
+  path?: string
+  routePath?: string
+  messages: unknown[]
+  stream?: boolean
+  request?: Record<string, unknown>
+}
+
+export interface AgentCompletionTaskPayload {
+  agentId?: string
+  model?: string
+  path?: string
+  routePath?: string
+  prompt: string
+  stream?: boolean
+  request?: Record<string, unknown>
+}
+
+export interface ServiceChatTaskPayload {
+  serviceId: string
+  model?: string
+  path?: string
+  servicePath?: string
+  messages: unknown[]
+  stream?: boolean
+  request?: Record<string, unknown>
+}
+
+export interface ServiceCompletionTaskPayload {
+  serviceId: string
+  model?: string
+  path?: string
+  servicePath?: string
+  prompt: string
+  stream?: boolean
+  request?: Record<string, unknown>
+}
+
+export interface ServiceEmbeddingTaskPayload {
+  serviceId: string
+  model?: string
+  path?: string
+  servicePath?: string
+  input: string | string[]
+  request?: Record<string, unknown>
+}
+
+export interface ToolHttpTaskPayload {
+  url?: string
+  path?: string
+  baseUrl?: string
+  method?: string
+  headers?: Record<string, string>
+  query?: Record<string, string | number | boolean>
+  body?: unknown
+  stream?: boolean
+  unwrapSuccessEnvelope?: boolean
+}
+
+export type TaskPayload =
+  | AgentChatTaskPayload
+  | AgentCompletionTaskPayload
+  | ServiceChatTaskPayload
+  | ServiceCompletionTaskPayload
+  | ServiceEmbeddingTaskPayload
+  | ToolHttpTaskPayload
+  | Record<string, unknown>
+
 export type TaskEventType =
   | 'created'
   | 'updated'
@@ -268,12 +347,16 @@ export type TaskEventType =
   | 'completed'
   | 'failed'
   | 'cancelled'
+  | 'stream_started'
+  | 'stream_delta'
+  | 'stream_completed'
+  | 'evidence_indexed'
 
 export interface TaskRecord {
   id: string
   title: string
   description?: string
-  kind?: string
+  kind?: TaskKind | string
   status: TaskStatus
   priority: TaskPriority
   parentTaskId?: string
@@ -288,7 +371,7 @@ export interface TaskRecord {
   maxRetries: number
   dependsOnTaskIds: string[]
   childrenCount: number
-  payload?: Record<string, unknown>
+  payload?: TaskPayload
   metadata?: Record<string, unknown>
   error?: string
   createdAt: number

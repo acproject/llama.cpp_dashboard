@@ -1,6 +1,6 @@
 import { KEYS, deleteKey, evidenceSearchF, getJson, graphAddEdge, graphDelEdge, graphEdgePropSet, keys, metaset, objset, setJson, setString, tagadd } from '@/lib/minimemory'
 import { generateId } from '@/lib/utils'
-import { LlamaService, RagChunkRecord, RagCollection, RagDocument, RagMetric, RagRetrievalHit } from '@/types'
+import { LlamaService, RagChunkRecord, RagCollection, RagDocument, RagMetric, RagRetrievalHit, TaskEvidenceRecord, TaskRecord } from '@/types'
 
 const DEFAULT_CHUNK_SIZE = 900
 const DEFAULT_CHUNK_OVERLAP = 120
@@ -10,6 +10,9 @@ const DEFAULT_GRAPH_DEPTH = 1
 const DEFAULT_EMBEDDING_SPACE = 'e5-multi-large-instruct_d1024_cosine'
 const CHUNK_MIME = 'text/plain'
 const MIN_EMBEDDING_CHUNK_SIZE = 180
+const TASK_EVIDENCE_COLLECTION_NAME = 'Task Evidence'
+const TASK_EVIDENCE_COLLECTION_DESCRIPTION = 'Worker task evidence, tool outputs, streamed model responses, and execution artifacts'
+const TASK_EVIDENCE_COLLECTION_TYPE = 'task_evidence'
 
 type CollectionInput = {
   name?: string
@@ -83,6 +86,14 @@ function getDocumentGraphNode(collectionId: string, documentId: string): string 
 
 function getTopicGraphNode(collectionId: string, label: string): string {
   return `rag:graph:topic:${collectionId}:${slugify(label)}`
+}
+
+function getTaskGraphNode(taskId: string): string {
+  return `task:graph:task:${taskId}`
+}
+
+function getTaskKindGraphNode(taskKind: string): string {
+  return `task:graph:kind:${slugify(taskKind)}`
 }
 
 function getChunkId(collectionId: string, documentId: string, chunkIndex: number): string {
@@ -418,6 +429,25 @@ export async function createRagCollection(input: CollectionInput): Promise<RagCo
   return collection
 }
 
+export async function ensureTaskEvidenceCollection(): Promise<RagCollection> {
+  const collections = await listRagCollections()
+  const existing = collections.find(
+    (item) => item.metadata?.systemCollectionType === TASK_EVIDENCE_COLLECTION_TYPE
+  )
+
+  if (existing) {
+    return existing
+  }
+
+  return await createRagCollection({
+    name: TASK_EVIDENCE_COLLECTION_NAME,
+    description: TASK_EVIDENCE_COLLECTION_DESCRIPTION,
+    metadata: {
+      systemCollectionType: TASK_EVIDENCE_COLLECTION_TYPE,
+    },
+  })
+}
+
 export async function updateRagCollection(collectionId: string, input: CollectionInput): Promise<RagCollection> {
   const existing = await getRagCollection(collectionId)
   if (!existing) {
@@ -598,6 +628,66 @@ export async function ingestRagDocument(collectionId: string, input: DocumentInp
   }
 }
 
+export async function indexTaskEvidenceInRag(
+  task: Pick<TaskRecord, 'id' | 'title' | 'kind' | 'runId' | 'sessionId' | 'requestedAgentId' | 'assignedAgentId'>,
+  evidence: TaskEvidenceRecord
+): Promise<{ collection: RagCollection; document: RagDocument }> {
+  const content = buildTaskEvidenceContent(task, evidence)
+  if (!content) {
+    throw new Error('Task evidence content is empty')
+  }
+
+  const collection = await ensureTaskEvidenceCollection()
+  const tags = [
+    'task-evidence',
+    `task:${task.id}`,
+    `evidence:${evidence.kind}`,
+    ...(task.kind ? [`task-kind:${slugify(task.kind)}`] : []),
+    ...(task.assignedAgentId ? [`agent:${task.assignedAgentId}`] : []),
+  ]
+  const graphNodes = [
+    task.title || task.id,
+    evidence.kind,
+    ...(task.kind ? [task.kind] : []),
+  ]
+  const indexed = await ingestRagDocument(collection.id, {
+    title: evidence.title || task.title || `Task ${task.id} evidence`,
+    source: evidence.source || evidence.uri || `task:${task.id}`,
+    content,
+    tags,
+    graphNodes,
+    metadata: {
+      taskId: task.id,
+      taskKind: task.kind || null,
+      evidenceId: evidence.id,
+      evidenceKind: evidence.kind,
+      runId: task.runId || null,
+      sessionId: task.sessionId || null,
+      requestedAgentId: task.requestedAgentId || null,
+      assignedAgentId: task.assignedAgentId || null,
+      uri: evidence.uri || null,
+      source: evidence.source || null,
+    },
+  })
+
+  const taskNode = getTaskGraphNode(task.id)
+  await metaset(taskNode, 'type', 'task')
+  await metaset(taskNode, 'taskId', task.id)
+  await metaset(taskNode, 'label', task.title || task.id)
+  if (task.kind) {
+    await metaset(taskNode, 'kind', task.kind)
+    const taskKindNode = getTaskKindGraphNode(task.kind)
+    await metaset(taskKindNode, 'type', 'task_kind')
+    await metaset(taskKindNode, 'label', task.kind)
+    await graphAddEdge(taskKindNode, 'HAS_TASK', taskNode)
+    await graphAddEdge(taskKindNode, 'HAS_EVIDENCE_DOCUMENT', getDocumentGraphNode(indexed.collection.id, indexed.document.id))
+  }
+
+  await graphAddEdge(taskNode, 'HAS_EVIDENCE_DOCUMENT', getDocumentGraphNode(indexed.collection.id, indexed.document.id))
+
+  return indexed
+}
+
 type ParsedEvidenceHit = {
   rawId: string
   score: number | null
@@ -692,6 +782,32 @@ function sortHits(items: RagRetrievalHit[]): RagRetrievalHit[] {
     if (b.score === null) return -1
     return b.score - a.score
   })
+}
+
+function buildTaskEvidenceContent(
+  task: Pick<TaskRecord, 'id' | 'title' | 'kind' | 'runId' | 'sessionId' | 'requestedAgentId' | 'assignedAgentId'>,
+  evidence: TaskEvidenceRecord
+): string {
+  const sections = [
+    evidence.title ? `title: ${evidence.title}` : null,
+    task.title ? `task: ${task.title}` : null,
+    task.kind ? `task_kind: ${task.kind}` : null,
+    `evidence_kind: ${evidence.kind}`,
+    evidence.source ? `source: ${evidence.source}` : null,
+    evidence.uri ? `uri: ${evidence.uri}` : null,
+    typeof evidence.content === 'string' && evidence.content.trim() ? evidence.content.trim() : null,
+    evidence.metadata ? safeJsonStringify(evidence.metadata) : null,
+  ].filter((item): item is string => Boolean(item))
+
+  return sections.join('\n\n').trim()
+}
+
+function safeJsonStringify(value: unknown): string {
+  try {
+    return JSON.stringify(value, null, 2)
+  } catch {
+    return String(value)
+  }
 }
 
 export async function retrieveRagContext(input: RetrieveInput): Promise<{ collection: RagCollection; hits: RagRetrievalHit[]; contextText: string }> {

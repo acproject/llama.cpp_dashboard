@@ -3,9 +3,12 @@ import os from 'node:os'
 const config = buildConfig()
 const TASK_HANDLERS = {
   mock: executeMockTask,
-  agent: executeAgentTask,
-  service: executeServiceTask,
-  tool: executeToolTask,
+  'agent.chat': executeAgentTask,
+  'agent.completion': executeAgentTask,
+  'service.chat': executeServiceTask,
+  'service.completion': executeServiceTask,
+  'service.embedding': executeServiceEmbeddingTask,
+  'tool.http': executeToolTask,
 }
 
 let running = true
@@ -170,12 +173,12 @@ async function request(path, options = {}) {
   })
 }
 
-async function fetchJson(url, options = {}) {
+async function fetchResponse(url, options = {}) {
   const controller = new AbortController()
   const timeoutId = setTimeout(() => controller.abort(), config.requestTimeoutMs)
 
   try {
-    const response = await fetch(url, {
+    return await fetch(url, {
       method: options.method || 'GET',
       headers: {
         'Content-Type': 'application/json',
@@ -184,24 +187,41 @@ async function fetchJson(url, options = {}) {
       body: options.body ? JSON.stringify(options.body) : undefined,
       signal: controller.signal,
     })
-
-    const payload = await parseResponseBody(response)
-    if (!response.ok) {
-      throw new Error(extractErrorMessage(payload, response.status))
-    }
-
-    if (options.unwrapSuccessEnvelope === false) {
-      return payload
-    }
-
-    if (!payload?.success) {
-      throw new Error(payload?.error || `request failed: ${response.status}`)
-    }
-
-    return payload.data
   } finally {
     clearTimeout(timeoutId)
   }
+}
+
+async function fetchJson(url, options = {}) {
+  const response = await fetchResponse(url, options)
+  const payload = await parseResponseBody(response)
+  if (!response.ok) {
+    throw new Error(extractErrorMessage(payload, response.status))
+  }
+
+  if (options.unwrapSuccessEnvelope === false) {
+    return payload
+  }
+
+  if (!payload?.success) {
+    throw new Error(payload?.error || `request failed: ${response.status}`)
+  }
+
+  return payload.data
+}
+
+async function appendTaskEvent(taskId, event) {
+  await request(`/api/tasks/${taskId}/events`, {
+    method: 'POST',
+    body: event,
+  })
+}
+
+async function writeTaskResult(taskId, result) {
+  await request(`/api/tasks/${taskId}/result`, {
+    method: 'PUT',
+    body: result,
+  })
 }
 
 function buildConfig() {
@@ -266,12 +286,16 @@ function resolveTaskHandlerKey(kind) {
     return 'mock'
   }
 
-  if (kind === 'mock') {
-    return 'mock'
+  const normalized = kind.trim()
+  if (normalized in TASK_HANDLERS) {
+    return normalized
   }
 
-  const namespace = kind.trim().split('.')[0]
-  return namespace in TASK_HANDLERS ? namespace : 'mock'
+  if (normalized === 'agent') return 'agent.chat'
+  if (normalized === 'service') return 'service.chat'
+  if (normalized === 'tool') return 'tool.http'
+
+  return 'mock'
 }
 
 async function executeMockTask(task) {
@@ -405,6 +429,31 @@ async function executeServiceTask(task) {
     'x-orchestrator-task-id': task.id,
     ...(service.apiKey ? { Authorization: `Bearer ${service.apiKey}` } : {}),
   }
+
+  if (payload.stream === true) {
+    return await executeStreamingTask(task, {
+      target: 'service',
+      url: serviceUrl,
+      method: 'POST',
+      headers,
+      body: {
+        ...requestBody,
+        stream: true,
+      },
+      metadata: {
+        handler: 'service',
+        serviceId: service.id,
+        servicePath,
+        model: requestBody.model || service.model || null,
+      },
+      evidenceKind: 'service-response',
+      evidenceMetadata: {
+        serviceId: service.id,
+        model: requestBody.model || service.model || null,
+      },
+    })
+  }
+
   const response = await fetchJson(serviceUrl, {
     method: 'POST',
     headers,
@@ -439,6 +488,61 @@ async function executeServiceTask(task) {
   }
 }
 
+async function executeServiceEmbeddingTask(task) {
+  const payload = readTaskPayload(task)
+  const serviceId = firstString(payload.serviceId, payload.service_id, payload.targetServiceId)
+
+  if (!serviceId) {
+    throw new Error(`Task ${task.id} is missing serviceId`)
+  }
+
+  const service = await request(`/api/services/${encodeURIComponent(serviceId)}`)
+  const servicePath = firstString(
+    payload.path,
+    payload.servicePath,
+    '/v1/embeddings'
+  )
+  const requestBody = buildServiceEmbeddingRequestBody(task, payload, service)
+  const serviceUrl = joinUrl(`http://${service.host}:${service.port}`, servicePath)
+  const headers = {
+    'x-orchestrator-task-id': task.id,
+    ...(service.apiKey ? { Authorization: `Bearer ${service.apiKey}` } : {}),
+  }
+  const response = await fetchJson(serviceUrl, {
+    method: 'POST',
+    headers,
+    body: requestBody,
+    unwrapSuccessEnvelope: false,
+  })
+  const vectors = Array.isArray(response?.data) ? response.data.length : 0
+
+  return {
+    status: 'success',
+    summary: `${task.title || task.id}: embedding vectors=${vectors}`,
+    output: response,
+    metadata: {
+      handler: 'service.embedding',
+      serviceId: service.id,
+      servicePath,
+      model: typeof response?.model === 'string' ? response.model : requestBody.model || service.model || null,
+      vectorCount: vectors,
+    },
+    evidence: [
+      {
+        kind: 'service-embedding',
+        title: task.title || task.id,
+        content: stringifyData(response),
+        source: serviceUrl,
+        metadata: {
+          serviceId: service.id,
+          model: typeof response?.model === 'string' ? response.model : requestBody.model || service.model || null,
+          vectorCount: vectors,
+        },
+      },
+    ],
+  }
+}
+
 async function executeToolTask(task) {
   const payload = readTaskPayload(task)
   const url = resolveToolUrl(payload)
@@ -448,6 +552,25 @@ async function executeToolTask(task) {
   }
 
   const method = normalizeHttpMethod(payload.method)
+  if (payload.stream === true) {
+    return await executeStreamingTask(task, {
+      target: 'tool',
+      url,
+      method,
+      headers: isRecord(payload.headers) ? payload.headers : undefined,
+      body: method === 'GET' || method === 'HEAD' ? undefined : payload.body,
+      metadata: {
+        handler: 'tool',
+        url,
+        method,
+      },
+      evidenceKind: 'tool-response',
+      evidenceMetadata: {
+        method,
+      },
+    })
+  }
+
   const response = await fetchJson(url, {
     method,
     headers: isRecord(payload.headers) ? payload.headers : undefined,
@@ -595,17 +718,57 @@ function buildServiceRequestBody(task, payload, service) {
   return requestBody
 }
 
-function resolveToolUrl(payload) {
-  if (typeof payload.url === 'string' && payload.url.trim()) {
-    return payload.url.trim()
+function buildServiceEmbeddingRequestBody(task, payload, service) {
+  const requestBody = isRecord(payload.request)
+    ? { ...payload.request }
+    : isRecord(payload.body)
+      ? { ...payload.body }
+      : {}
+
+  if (!requestBody.model && typeof payload.model === 'string') {
+    requestBody.model = payload.model
+  }
+  if (!requestBody.model && typeof service?.model === 'string') {
+    requestBody.model = service.model
+  }
+  if (!requestBody.input && payload.input) {
+    requestBody.input = payload.input
+  }
+  requestBody.metadata = {
+    ...(isRecord(requestBody.metadata) ? requestBody.metadata : {}),
+    orchestratorTaskId: task.id,
+    workerExecutorId: config.executorId,
   }
 
-  if (typeof payload.path !== 'string' || !payload.path.trim()) {
+  return requestBody
+}
+
+function resolveToolUrl(payload) {
+  const baseUrl = typeof payload.url === 'string' && payload.url.trim()
+    ? payload.url.trim()
+    : typeof payload.path === 'string' && payload.path.trim()
+      ? joinUrl(firstString(payload.baseUrl, config.baseUrl), payload.path)
+      : null
+
+  if (!baseUrl) {
     return null
   }
 
-  const base = firstString(payload.baseUrl, config.baseUrl)
-  return joinUrl(base, payload.path)
+  return appendQueryParams(baseUrl, payload.query)
+}
+
+function appendQueryParams(url, query) {
+  if (!isRecord(query)) {
+    return url
+  }
+
+  const nextUrl = new URL(url)
+  for (const [key, value] of Object.entries(query)) {
+    if (value === null || typeof value === 'undefined') continue
+    nextUrl.searchParams.set(key, String(value))
+  }
+
+  return nextUrl.toString()
 }
 
 function joinUrl(base, path) {
@@ -619,6 +782,376 @@ function isChatKind(kind) {
 function normalizeHttpMethod(value) {
   const normalized = typeof value === 'string' ? value.trim().toUpperCase() : 'POST'
   return normalized || 'POST'
+}
+
+async function executeStreamingTask(task, input) {
+  const response = await fetchResponse(input.url, {
+    method: input.method,
+    headers: input.headers,
+    body: input.body,
+  })
+
+  if (!response.ok) {
+    const payload = await parseResponseBody(response)
+    throw new Error(extractErrorMessage(payload, response.status))
+  }
+
+  const contentType = response.headers.get('content-type') || ''
+  const streamState = createStreamState()
+  await appendTaskEvent(task.id, {
+    type: 'stream_started',
+    detail: `${input.target} stream started`,
+    actorId: config.executorId,
+    actorType: 'worker',
+    metadata: {
+      target: input.target,
+      url: input.url,
+      method: input.method,
+      contentType,
+      status: response.status,
+    },
+  })
+
+  if (!response.body) {
+    const payload = await parseResponseBody(response)
+    const content = extractCompletionContent(payload)
+    await writeTaskResult(task.id, {
+      status: 'partial',
+      summary: summarizeTaskResult(task, content, `${input.target} stream completed ${task.id}`),
+      output: payload,
+      metadata: {
+        ...(isRecord(input.metadata) ? input.metadata : {}),
+        stream: true,
+        contentType,
+      },
+    })
+    await appendTaskEvent(task.id, {
+      type: 'stream_completed',
+      detail: `${input.target} stream completed`,
+      actorId: config.executorId,
+      actorType: 'worker',
+      metadata: {
+        target: input.target,
+        chunkCount: 0,
+        outputLength: content.length,
+        contentType,
+      },
+    })
+
+    return {
+      status: 'success',
+      summary: summarizeTaskResult(task, content, `${input.target} handler completed ${task.id}`),
+      output: payload,
+      metadata: {
+        ...(isRecord(input.metadata) ? input.metadata : {}),
+        stream: true,
+        chunkCount: 0,
+        contentType,
+      },
+      evidence: [
+        {
+          kind: input.evidenceKind,
+          title: task.title || task.id,
+          content,
+          source: input.url,
+          metadata: {
+            ...(isRecord(input.evidenceMetadata) ? input.evidenceMetadata : {}),
+            stream: true,
+            chunkCount: 0,
+          },
+        },
+      ],
+    }
+  }
+
+  await consumeStreamResponse(response, async (chunk) => {
+    const delta = resolveStreamDelta(chunk)
+    if (!delta.raw) {
+      return
+    }
+
+    const chunkIndex = streamState.rawChunks.length + 1
+    streamState.rawChunks.push(delta.raw)
+    if (delta.content) {
+      streamState.contentChunks.push(delta.content)
+    }
+    if (delta.finishReason && !streamState.finishReason) {
+      streamState.finishReason = delta.finishReason
+    }
+
+    await appendTaskEvent(task.id, {
+      type: 'stream_delta',
+      detail: `${input.target} stream delta ${chunkIndex}`,
+      actorId: config.executorId,
+      actorType: 'worker',
+      metadata: {
+        target: input.target,
+        chunkIndex,
+        delta: truncate(delta.content || delta.raw, 1200),
+        finishReason: delta.finishReason || null,
+      },
+    })
+
+    if (streamState.rawChunks.length === 1 || streamState.rawChunks.length % 5 === 0) {
+      await flushStreamingTaskResult(task, input, streamState, contentType)
+    }
+  })
+
+  await flushStreamingTaskResult(task, input, streamState, contentType)
+  const content = getStreamOutputText(streamState)
+  await appendTaskEvent(task.id, {
+    type: 'stream_completed',
+    detail: `${input.target} stream completed`,
+    actorId: config.executorId,
+    actorType: 'worker',
+    metadata: {
+      target: input.target,
+      chunkCount: streamState.rawChunks.length,
+      outputLength: content.length,
+      contentType,
+      finishReason: streamState.finishReason || null,
+    },
+  })
+
+  return {
+    status: 'success',
+    summary: summarizeTaskResult(task, content, `${input.target} handler completed ${task.id}`),
+    output: {
+      stream: true,
+      content,
+      raw: streamState.rawChunks.join(''),
+      chunkCount: streamState.rawChunks.length,
+      contentType,
+      finishReason: streamState.finishReason || null,
+    },
+    metadata: {
+      ...(isRecord(input.metadata) ? input.metadata : {}),
+      stream: true,
+      chunkCount: streamState.rawChunks.length,
+      contentType,
+      finishReason: streamState.finishReason || null,
+    },
+    evidence: [
+      {
+        kind: input.evidenceKind,
+        title: task.title || task.id,
+        content,
+        source: input.url,
+        metadata: {
+          ...(isRecord(input.evidenceMetadata) ? input.evidenceMetadata : {}),
+          stream: true,
+          chunkCount: streamState.rawChunks.length,
+          finishReason: streamState.finishReason || null,
+        },
+      },
+    ],
+  }
+}
+
+async function flushStreamingTaskResult(task, input, streamState, contentType) {
+  const content = getStreamOutputText(streamState)
+  await writeTaskResult(task.id, {
+    status: 'partial',
+    summary: summarizeTaskResult(task, content, `${input.target} stream in progress ${task.id}`),
+    output: {
+      stream: true,
+      content,
+      raw: streamState.rawChunks.join(''),
+      chunkCount: streamState.rawChunks.length,
+      contentType,
+      finishReason: streamState.finishReason || null,
+    },
+    metadata: {
+      ...(isRecord(input.metadata) ? input.metadata : {}),
+      stream: true,
+      chunkCount: streamState.rawChunks.length,
+      contentType,
+      finishReason: streamState.finishReason || null,
+    },
+  })
+}
+
+function createStreamState() {
+  return {
+    contentChunks: [],
+    rawChunks: [],
+    finishReason: null,
+  }
+}
+
+function getStreamOutputText(streamState) {
+  const content = streamState.contentChunks.join('').trim()
+  if (content) {
+    return content
+  }
+
+  return streamState.rawChunks.join('').trim()
+}
+
+async function consumeStreamResponse(response, onChunk) {
+  const contentType = response.headers.get('content-type') || ''
+  if (!response.body) {
+    return
+  }
+
+  if (contentType.includes('text/event-stream')) {
+    await consumeEventStream(response.body, onChunk)
+    return
+  }
+
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    const text = decoder.decode(value, { stream: true })
+    if (text) {
+      await onChunk(text)
+    }
+  }
+
+  const rest = decoder.decode()
+  if (rest) {
+    await onChunk(rest)
+  }
+}
+
+async function consumeEventStream(body, onChunk) {
+  const reader = body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    buffer += decoder.decode(value, { stream: true })
+    const frames = extractEventStreamFrames(buffer)
+    buffer = frames.buffer
+    for (const frame of frames.items) {
+      await onChunk(frame)
+    }
+  }
+
+  buffer += decoder.decode()
+  const frames = extractEventStreamFrames(`${buffer}\n\n`)
+  for (const frame of frames.items) {
+    await onChunk(frame)
+  }
+}
+
+function extractEventStreamFrames(buffer) {
+  const items = []
+  let remaining = buffer
+
+  while (true) {
+    const separatorIndex = remaining.search(/\r?\n\r?\n/)
+    if (separatorIndex < 0) {
+      break
+    }
+
+    const frame = remaining.slice(0, separatorIndex)
+    const separatorMatch = remaining.slice(separatorIndex).match(/^\r?\n\r?\n/)
+    remaining = remaining.slice(separatorIndex + (separatorMatch ? separatorMatch[0].length : 2))
+
+    const data = frame
+      .split(/\r?\n/)
+      .filter((line) => line.startsWith('data:'))
+      .map((line) => line.slice(5).trimStart())
+      .join('\n')
+      .trim()
+
+    if (data && data !== '[DONE]') {
+      items.push(data)
+    }
+  }
+
+  return {
+    items,
+    buffer: remaining,
+  }
+}
+
+function resolveStreamDelta(chunk) {
+  const raw = typeof chunk === 'string' ? chunk : stringifyData(chunk)
+  const parsed = parseJsonValue(raw)
+  if (!parsed) {
+    return {
+      raw,
+      content: raw,
+      finishReason: null,
+    }
+  }
+
+  const finishReason = extractFinishReason(parsed)
+  const content = extractStreamContent(parsed)
+  return {
+    raw,
+    content: content || raw,
+    finishReason,
+  }
+}
+
+function extractStreamContent(payload) {
+  if (!payload || typeof payload !== 'object') {
+    return null
+  }
+
+  if (typeof payload.content === 'string') {
+    return payload.content
+  }
+
+  if (Array.isArray(payload.choices) && payload.choices.length > 0) {
+    const choice = payload.choices[0]
+    const deltaContent = normalizeContentValue(choice?.delta?.content)
+    if (deltaContent) {
+      return deltaContent
+    }
+
+    const messageContent = normalizeContentValue(choice?.message?.content)
+    if (messageContent) {
+      return messageContent
+    }
+
+    if (typeof choice?.text === 'string' && choice.text.trim()) {
+      return choice.text
+    }
+  }
+
+  return null
+}
+
+function normalizeContentValue(value) {
+  if (typeof value === 'string') {
+    return value
+  }
+
+  if (Array.isArray(value)) {
+    const text = value
+      .map((item) => {
+        if (typeof item === 'string') return item
+        if (typeof item?.text === 'string') return item.text
+        return ''
+      })
+      .filter(Boolean)
+      .join('\n')
+      .trim()
+
+    return text || null
+  }
+
+  return null
+}
+
+function parseJsonValue(value) {
+  if (typeof value !== 'string') {
+    return null
+  }
+
+  try {
+    return JSON.parse(value)
+  } catch {
+    return null
+  }
 }
 
 function firstString(...values) {
