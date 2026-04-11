@@ -1,7 +1,8 @@
 import { deleteKey, getJson, getJsonList, KEYS, keys, pushJsonList, setJson, tagadd } from '@/lib/minimemory'
+import { createMemoryFromTaskEvidence } from '@/lib/memory'
 import { indexTaskEvidenceInRag } from '@/lib/rag'
 import { generateId } from '@/lib/utils'
-import { TaskClaimResult, TaskEvent, TaskEventType, TaskEvidenceRecord, TaskKind, TaskLease, TaskPayload, TaskPriority, TaskQueueStats, TaskRecord, TaskResult, TaskRuntimeView, TaskStatus } from '@/types'
+import { TaskClaimResult, TaskDagView, TaskDependencyEdge, TaskDependencyNode, TaskDependencyUnlockData, TaskEvent, TaskEventType, TaskEvidenceRecord, TaskKind, TaskLease, TaskPayload, TaskPriority, TaskQueueStats, TaskRecord, TaskResult, TaskRuntimeView, TaskStatus } from '@/types'
 
 const TASK_TTL_MS = 7 * 24 * 60 * 60 * 1000
 const TASK_EVENT_LIMIT = 200
@@ -517,6 +518,95 @@ export async function getTaskRuntimeSnapshot(filters: TaskFilters = {}): Promise
   }
 }
 
+export async function listDependentTasks(taskId: string): Promise<TaskRecord[]> {
+  const target = await getTask(taskId)
+  if (!target) return []
+
+  const tasks = await listTasks()
+  const scopeRootId = target.rootTaskId || target.id
+
+  return tasks.filter((task) => {
+    if (task.id === taskId) return false
+    if ((task.rootTaskId || task.id) !== scopeRootId) return false
+    return task.dependsOnTaskIds.includes(taskId)
+  })
+}
+
+export async function getTaskDependencyUnlockData(taskId: string): Promise<TaskDependencyUnlockData> {
+  const task = await getTask(taskId)
+  if (!task) throw new Error(`Task not found: ${taskId}`)
+
+  const dependents = await listDependentTasks(taskId)
+  const states = await Promise.all(
+    dependents.map(async (dependent) => ({
+      taskId: dependent.id,
+      state: await getTaskDependencyState(dependent),
+      status: dependent.status,
+    }))
+  )
+
+  return {
+    taskId,
+    completedDependencyTaskIds: task.status === 'completed' ? [taskId] : [],
+    newlyClaimableTaskIds: states
+      .filter((item) => item.state.satisfied && item.state.failedDependencyTaskIds.length === 0 && (item.status === 'queued' || item.status === 'pending'))
+      .map((item) => item.taskId),
+    stillBlockedTaskIds: states
+      .filter((item) => !item.state.satisfied && item.state.failedDependencyTaskIds.length === 0)
+      .map((item) => item.taskId),
+    failedPropagationCandidates: states
+      .filter((item) => item.state.failedDependencyTaskIds.length > 0)
+      .map((item) => item.taskId),
+  }
+}
+
+export async function getTaskDag(taskId: string): Promise<TaskDagView> {
+  const focusTask = await getTask(taskId)
+  if (!focusTask) {
+    throw new Error(`Task not found: ${taskId}`)
+  }
+
+  const workflowTasks = await listWorkflowTasks(focusTask)
+  const taskMap = new Map(workflowTasks.map((task) => [task.id, task]))
+  const dependentMap = buildDependentMap(workflowTasks)
+  const nodes = await Promise.all(
+    workflowTasks.map(async (task) => {
+      const dependencyState = await getTaskDependencyState(task, taskMap)
+      const lease = await getTaskLease(task.id)
+
+      return {
+        taskId: task.id,
+        title: task.title,
+        kind: task.kind,
+        status: task.status,
+        priority: task.priority,
+        queueName: task.queueName,
+        parentTaskId: task.parentTaskId,
+        rootTaskId: task.rootTaskId,
+        dependsOnTaskIds: task.dependsOnTaskIds,
+        dependentTaskIds: dependentMap.get(task.id) || [],
+        blockedByTaskIds: dependencyState.blockedByTaskIds,
+        failedDependencyTaskIds: dependencyState.failedDependencyTaskIds,
+        dependencyDepth: computeTaskDependencyDepth(task.id, taskMap),
+        isClaimable: await isTaskClaimable(task, lease, Date.now()),
+        createdAt: task.createdAt,
+        updatedAt: task.updatedAt,
+      } satisfies TaskDependencyNode
+    })
+  )
+
+  const edges = buildTaskDagEdges(workflowTasks)
+  const unlock = await getTaskDependencyUnlockData(taskId)
+
+  return {
+    rootTaskId: focusTask.rootTaskId || focusTask.id,
+    focusTaskId: focusTask.id,
+    nodes: nodes.sort((a, b) => a.dependencyDepth - b.dependencyDepth || a.createdAt - b.createdAt || a.taskId.localeCompare(b.taskId)),
+    edges,
+    unlock,
+  }
+}
+
 export async function getTaskLease(taskId: string): Promise<TaskLease | null> {
   return await getJson<TaskLease>(KEYS.TASK_LEASE(taskId))
 }
@@ -809,6 +899,41 @@ export async function addTaskEvidence(taskId: string, input: unknown): Promise<T
         },
       })
     }
+  }
+
+  try {
+    const memory = await createMemoryFromTaskEvidence(task, record)
+    record.metadata = {
+      ...(record.metadata || {}),
+      memory: {
+        id: memory.id,
+        space: memory.space,
+      },
+    }
+    await setJson(KEYS.TASK_EVIDENCE(taskId, record.id), record, TASK_TTL_MS)
+    await appendTaskEvent(taskId, {
+      type: 'updated',
+      detail: `task evidence mirrored into memory: ${record.kind}`,
+      metadata: {
+        evidenceId: record.id,
+        memoryId: memory.id,
+        space: memory.space,
+      },
+    })
+  } catch (error) {
+    record.metadata = {
+      ...(record.metadata || {}),
+      memoryError: error instanceof Error ? error.message : String(error),
+    }
+    await setJson(KEYS.TASK_EVIDENCE(taskId, record.id), record, TASK_TTL_MS)
+    await appendTaskEvent(taskId, {
+      type: 'updated',
+      detail: `task evidence memory mirror failed: ${record.kind}`,
+      metadata: {
+        evidenceId: record.id,
+        error: error instanceof Error ? error.message : String(error),
+      },
+    })
   }
 
   return record
@@ -1255,10 +1380,134 @@ async function removeTaskIdFromQueue(queueName: string, taskId: string) {
   await setJson(KEYS.TASK_QUEUE(queueName), nextIds, TASK_TTL_MS)
 }
 
+type TaskDependencyState = {
+  satisfied: boolean
+  blockedByTaskIds: string[]
+  failedDependencyTaskIds: string[]
+}
+
+async function getTaskDependencyState(
+  task: TaskRecord,
+  taskMap?: Map<string, TaskRecord>
+): Promise<TaskDependencyState> {
+  if (task.dependsOnTaskIds.length === 0) {
+    return {
+      satisfied: true,
+      blockedByTaskIds: [],
+      failedDependencyTaskIds: [],
+    }
+  }
+
+  const dependencies = await Promise.all(
+    task.dependsOnTaskIds.map(async (dependencyId) => taskMap?.get(dependencyId) || await getTask(dependencyId))
+  )
+  const blockedByTaskIds: string[] = []
+  const failedDependencyTaskIds: string[] = []
+
+  for (let index = 0; index < task.dependsOnTaskIds.length; index += 1) {
+    const dependencyId = task.dependsOnTaskIds[index]
+    const dependency = dependencies[index]
+    if (!dependency) {
+      blockedByTaskIds.push(dependencyId)
+      continue
+    }
+    if (dependency.status === 'failed' || dependency.status === 'cancelled') {
+      failedDependencyTaskIds.push(dependency.id)
+      continue
+    }
+    if (dependency.status !== 'completed') {
+      blockedByTaskIds.push(dependency.id)
+    }
+  }
+
+  return {
+    satisfied: blockedByTaskIds.length === 0 && failedDependencyTaskIds.length === 0,
+    blockedByTaskIds,
+    failedDependencyTaskIds,
+  }
+}
+
+async function listWorkflowTasks(task: TaskRecord): Promise<TaskRecord[]> {
+  const tasks = await listTasks()
+  const rootTaskId = task.rootTaskId || task.id
+  const rootScoped = tasks.filter((item) => (item.rootTaskId || item.id) === rootTaskId)
+  if (rootScoped.length > 0) return rootScoped
+
+  const localIds = new Set<string>([
+    task.id,
+    ...(task.parentTaskId ? [task.parentTaskId] : []),
+    ...task.dependsOnTaskIds,
+  ])
+  return tasks.filter((item) => localIds.has(item.id) || item.dependsOnTaskIds.some((dependencyId) => localIds.has(dependencyId)))
+}
+
+function buildDependentMap(tasks: TaskRecord[]): Map<string, string[]> {
+  const dependentMap = new Map<string, string[]>()
+
+  for (const task of tasks) {
+    for (const dependencyId of task.dependsOnTaskIds) {
+      const existing = dependentMap.get(dependencyId) || []
+      if (!existing.includes(task.id)) {
+        dependentMap.set(dependencyId, [...existing, task.id])
+      }
+    }
+  }
+
+  return dependentMap
+}
+
+function buildTaskDagEdges(tasks: TaskRecord[]): TaskDependencyEdge[] {
+  const edges: TaskDependencyEdge[] = []
+  const edgeKeys = new Set<string>()
+
+  for (const task of tasks) {
+    for (const dependencyId of task.dependsOnTaskIds) {
+      const key = `depends_on:${task.id}:${dependencyId}`
+      if (edgeKeys.has(key)) continue
+      edgeKeys.add(key)
+      edges.push({
+        fromTaskId: task.id,
+        toTaskId: dependencyId,
+        relation: 'depends_on',
+      })
+    }
+
+    if (task.parentTaskId) {
+      const key = `parent_child:${task.parentTaskId}:${task.id}`
+      if (edgeKeys.has(key)) continue
+      edgeKeys.add(key)
+      edges.push({
+        fromTaskId: task.parentTaskId,
+        toTaskId: task.id,
+        relation: 'parent_child',
+      })
+    }
+  }
+
+  return edges
+}
+
+function computeTaskDependencyDepth(
+  taskId: string,
+  taskMap: Map<string, TaskRecord>,
+  visiting = new Set<string>()
+): number {
+  const task = taskMap.get(taskId)
+  if (!task || task.dependsOnTaskIds.length === 0) return 0
+  if (visiting.has(taskId)) return 0
+
+  visiting.add(taskId)
+  let depth = 0
+  for (const dependencyId of task.dependsOnTaskIds) {
+    depth = Math.max(depth, computeTaskDependencyDepth(dependencyId, taskMap, visiting) + 1)
+  }
+  visiting.delete(taskId)
+  return depth
+}
+
 async function areTaskDependenciesSatisfied(task: TaskRecord): Promise<boolean> {
-  if (task.dependsOnTaskIds.length === 0) return true
-  const dependencies = await Promise.all(task.dependsOnTaskIds.map((taskId) => getTask(taskId)))
-  return dependencies.every((dependency) => dependency?.status === 'completed')
+  const state = await getTaskDependencyState(task)
+  return state.satisfied
 }
 
 function isClaimableTask(task: TaskRecord, lease: TaskLease | null, now: number): boolean {

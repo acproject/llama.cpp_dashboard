@@ -23,7 +23,7 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
-import { MonitorData, RunRecord, SessionBindingView, TaskEvent, TaskLease, TaskRecord, TaskResult, TaskRuntimeView } from '@/types'
+import { MemoryRecord, MonitorData, RunRecord, SessionBindingView, TaskDagView, TaskEvent, TaskEvidenceRecord, TaskLease, TaskRecord, TaskResult, TaskRuntimeView } from '@/types'
 import { formatDuration, formatTimestamp, getStatusBgColor } from '@/lib/utils'
 
 type TaskDetailData = {
@@ -32,6 +32,13 @@ type TaskDetailData = {
   children: TaskRecord[]
   lease: TaskLease | null
   result: TaskResult | null
+  evidence: TaskEvidenceRecord[]
+}
+
+type TaskEvidenceLinkData = {
+  evidence: TaskEvidenceRecord
+  memory?: MemoryRecord
+  task: TaskRecord
 }
 
 type ExecutorMode = 'payload' | 'success' | 'fail'
@@ -50,6 +57,10 @@ export default function MonitorPage() {
   const [taskDetail, setTaskDetail] = useState<TaskDetailData | null>(null)
   const [taskDetailLoading, setTaskDetailLoading] = useState(false)
   const [taskDetailError, setTaskDetailError] = useState<string | null>(null)
+  const [taskDag, setTaskDag] = useState<TaskDagView | null>(null)
+  const [taskDagError, setTaskDagError] = useState<string | null>(null)
+  const [taskEvidenceLinks, setTaskEvidenceLinks] = useState<TaskEvidenceLinkData[]>([])
+  const [taskEvidenceError, setTaskEvidenceError] = useState<string | null>(null)
   const [executorRunning, setExecutorRunning] = useState(false)
   const [executorMode, setExecutorMode] = useState<ExecutorMode>('payload')
   const [executorPollMs, setExecutorPollMs] = useState('3000')
@@ -87,16 +98,44 @@ export default function MonitorPage() {
   const fetchTaskDetail = useCallback(async (taskId: string) => {
     setTaskDetailLoading(true)
     setTaskDetailError(null)
+    setTaskDagError(null)
+    setTaskEvidenceError(null)
     try {
-      const response = await fetch(`/api/tasks/${taskId}`)
-      const result = await response.json()
-      if (!response.ok || !result.success) {
-        throw new Error(result.error || '加载任务详情失败')
+      const [detailResponse, dagResponse, evidenceResponse] = await Promise.all([
+        fetch(`/api/tasks/${taskId}`),
+        fetch(`/api/tasks/${taskId}/dag`),
+        fetch(`/api/tasks/${taskId}/evidence?include=memory`),
+      ])
+
+      const [detailResult, dagResult, evidenceResult] = await Promise.all([
+        detailResponse.json().catch(() => ({})),
+        dagResponse.json().catch(() => ({})),
+        evidenceResponse.json().catch(() => ({})),
+      ])
+
+      if (!detailResponse.ok || !detailResult.success) {
+        throw new Error(detailResult.error || '加载任务详情失败')
       }
-      setTaskDetail(result.data)
+      setTaskDetail(detailResult.data)
+
+      if (!dagResponse.ok || !dagResult.success) {
+        setTaskDag(null)
+        setTaskDagError(dagResult.error || '加载 DAG 失败')
+      } else {
+        setTaskDag(dagResult.data)
+      }
+
+      if (!evidenceResponse.ok || !evidenceResult.success) {
+        setTaskEvidenceLinks([])
+        setTaskEvidenceError(evidenceResult.error || '加载任务证据失败')
+      } else {
+        setTaskEvidenceLinks(Array.isArray(evidenceResult.data) ? evidenceResult.data : [])
+      }
     } catch (error) {
       setTaskDetailError(error instanceof Error ? error.message : String(error))
       setTaskDetail(null)
+      setTaskDag(null)
+      setTaskEvidenceLinks([])
     } finally {
       setTaskDetailLoading(false)
     }
@@ -340,6 +379,10 @@ export default function MonitorPage() {
     if (!detailTaskId) {
       setTaskDetail(null)
       setTaskDetailError(null)
+      setTaskDag(null)
+      setTaskDagError(null)
+      setTaskEvidenceLinks([])
+      setTaskEvidenceError(null)
       setTaskDetailLoading(false)
       return
     }
@@ -964,7 +1007,7 @@ export default function MonitorPage() {
               </Dialog.Close>
             </div>
 
-            <div className="space-y-6 p-6">
+            <div className="p-6">
               {taskDetailLoading ? (
                 <div className="flex items-center gap-2 text-muted-foreground">
                   <RefreshCw className="h-4 w-4 animate-spin" />
@@ -975,118 +1018,139 @@ export default function MonitorPage() {
                   {taskDetailError}
                 </div>
               ) : taskDetail ? (
-                <>
-                  <div className="rounded-lg border p-4 space-y-4">
-                    <div className="flex items-center gap-2 flex-wrap">
-                      <TaskStatusTag status={taskDetail.task.status} />
-                      <div className="font-medium break-all">{taskDetail.task.title}</div>
-                      {taskDetail.task.kind && (
-                        <span className="text-sm text-muted-foreground">{taskDetail.task.kind}</span>
-                      )}
-                    </div>
-                    <div className="grid grid-cols-1 xl:grid-cols-2 gap-3">
-                      <InfoRow label="Task ID" value={taskDetail.task.id} />
-                      <InfoRow label="Root Task" value={taskDetail.task.rootTaskId || taskDetail.task.id} />
-                      <InfoRow label="Parent Task" value={taskDetail.task.parentTaskId || '无'} />
-                      <InfoRow label="Queue" value={taskDetail.task.queueName || '未入队'} />
-                      <InfoRow label="Agent" value={taskDetail.task.assignedAgentName || taskDetail.task.assignedAgentId || '无'} />
-                      <InfoRow label="Requested Agent" value={taskDetail.task.requestedAgentId || '无'} />
-                      <InfoRow label="Run ID" value={taskDetail.task.runId || '无'} />
-                      <InfoRow label="Session" value={taskDetail.task.sessionId || '无'} />
-                    </div>
-                    {taskDetail.task.runId && (
-                      <div className="flex justify-start">
+                <Tabs defaultValue="overview" className="space-y-4">
+                  <TabsList>
+                    <TabsTrigger value="overview">概览</TabsTrigger>
+                    <TabsTrigger value="dag">DAG</TabsTrigger>
+                    <TabsTrigger value="evidence">证据</TabsTrigger>
+                  </TabsList>
+
+                  <TabsContent value="overview" className="space-y-6">
+                    <div className="rounded-lg border p-4 space-y-4">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <TaskStatusTag status={taskDetail.task.status} />
+                        <div className="font-medium break-all">{taskDetail.task.title}</div>
+                        {taskDetail.task.kind && (
+                          <span className="text-sm text-muted-foreground">{taskDetail.task.kind}</span>
+                        )}
+                      </div>
+                      <div className="grid grid-cols-1 xl:grid-cols-2 gap-3">
+                        <InfoRow label="Task ID" value={taskDetail.task.id} />
+                        <InfoRow label="Root Task" value={taskDetail.task.rootTaskId || taskDetail.task.id} />
+                        <InfoRow label="Parent Task" value={taskDetail.task.parentTaskId || '无'} />
+                        <InfoRow label="Queue" value={taskDetail.task.queueName || '未入队'} />
+                        <InfoRow label="Agent" value={taskDetail.task.assignedAgentName || taskDetail.task.assignedAgentId || '无'} />
+                        <InfoRow label="Requested Agent" value={taskDetail.task.requestedAgentId || '无'} />
+                        <InfoRow label="Run ID" value={taskDetail.task.runId || '无'} />
+                        <InfoRow label="Session" value={taskDetail.task.sessionId || '无'} />
+                      </div>
+                      <div className="flex flex-wrap gap-2">
+                        {taskDetail.task.runId && (
+                          <Button asChild variant="outline" size="sm">
+                            <Link href={`/runs/${encodeURIComponent(taskDetail.task.runId)}`}>
+                              查看关联 Run
+                            </Link>
+                          </Button>
+                        )}
                         <Button asChild variant="outline" size="sm">
-                          <Link href={`/runs/${encodeURIComponent(taskDetail.task.runId)}`}>
-                            查看关联 Run
+                          <Link href={`/evidence?taskId=${encodeURIComponent(taskDetail.task.id)}&space=${encodeURIComponent(`task:${taskDetail.task.id}`)}`}>
+                            在证据中心中打开
                           </Link>
                         </Button>
                       </div>
-                    )}
-                    <div className="grid grid-cols-1 xl:grid-cols-3 gap-3">
-                      <InfoRow label="创建时间" value={formatTimestamp(taskDetail.task.createdAt)} />
-                      <InfoRow label="更新时间" value={formatTimestamp(taskDetail.task.updatedAt)} />
-                      <InfoRow label="完成时间" value={taskDetail.task.completedAt ? formatTimestamp(taskDetail.task.completedAt) : '暂无'} />
-                    </div>
-                    {(taskDetail.lease || taskDetail.result || taskDetail.task.error) && (
                       <div className="grid grid-cols-1 xl:grid-cols-3 gap-3">
-                        <InfoRow
-                          label="Lease"
-                          value={taskDetail.lease ? `${taskDetail.lease.holderId} · ${formatTimestamp(taskDetail.lease.expiresAt)}` : '无'}
-                        />
-                        <InfoRow
-                          label="Result"
-                          value={taskDetail.result ? `${taskDetail.result.status}${taskDetail.result.summary ? ` · ${taskDetail.result.summary}` : ''}` : '无'}
-                        />
-                        <InfoRow label="错误" value={taskDetail.task.error || '无'} />
+                        <InfoRow label="创建时间" value={formatTimestamp(taskDetail.task.createdAt)} />
+                        <InfoRow label="更新时间" value={formatTimestamp(taskDetail.task.updatedAt)} />
+                        <InfoRow label="完成时间" value={taskDetail.task.completedAt ? formatTimestamp(taskDetail.task.completedAt) : '暂无'} />
                       </div>
-                    )}
-                  </div>
+                      {(taskDetail.lease || taskDetail.result || taskDetail.task.error) && (
+                        <div className="grid grid-cols-1 xl:grid-cols-3 gap-3">
+                          <InfoRow
+                            label="Lease"
+                            value={taskDetail.lease ? `${taskDetail.lease.holderId} · ${formatTimestamp(taskDetail.lease.expiresAt)}` : '无'}
+                          />
+                          <InfoRow
+                            label="Result"
+                            value={taskDetail.result ? `${taskDetail.result.status}${taskDetail.result.summary ? ` · ${taskDetail.result.summary}` : ''}` : '无'}
+                          />
+                          <InfoRow label="错误" value={taskDetail.task.error || '无'} />
+                        </div>
+                      )}
+                    </div>
 
-                  <div className="rounded-lg border p-4 space-y-4">
-                    <div className="font-medium">事件流</div>
-                    {taskDetail.events.length === 0 ? (
-                      <div className="text-sm text-muted-foreground">暂无事件</div>
-                    ) : (
-                      <div className="space-y-3">
-                        {taskDetail.events
-                          .slice()
-                          .sort((a, b) => b.timestamp - a.timestamp)
-                          .map((event, index) => (
-                            <div key={`${event.timestamp}-${event.type}-${index}`} className="rounded-md bg-muted/40 p-3 space-y-2">
-                              <div className="flex flex-col gap-1 xl:flex-row xl:items-center xl:justify-between">
-                                <div className="flex items-center gap-2 flex-wrap">
-                                  <span className="rounded-full bg-background px-2 py-1 text-xs font-medium">
-                                    {event.type}
-                                  </span>
-                                  <span className="text-sm">{event.detail || '无详情'}</span>
+                    <div className="rounded-lg border p-4 space-y-4">
+                      <div className="font-medium">事件流</div>
+                      {taskDetail.events.length === 0 ? (
+                        <div className="text-sm text-muted-foreground">暂无事件</div>
+                      ) : (
+                        <div className="space-y-3">
+                          {taskDetail.events
+                            .slice()
+                            .sort((a, b) => b.timestamp - a.timestamp)
+                            .map((event, index) => (
+                              <div key={`${event.timestamp}-${event.type}-${index}`} className="rounded-md bg-muted/40 p-3 space-y-2">
+                                <div className="flex flex-col gap-1 xl:flex-row xl:items-center xl:justify-between">
+                                  <div className="flex items-center gap-2 flex-wrap">
+                                    <span className="rounded-full bg-background px-2 py-1 text-xs font-medium">
+                                      {event.type}
+                                    </span>
+                                    <span className="text-sm">{event.detail || '无详情'}</span>
+                                  </div>
+                                  <div className="text-xs text-muted-foreground">
+                                    {formatTimestamp(event.timestamp)}
+                                  </div>
                                 </div>
-                                <div className="text-xs text-muted-foreground">
-                                  {formatTimestamp(event.timestamp)}
-                                </div>
+                                {(event.actorId || event.actorType) && (
+                                  <div className="text-sm text-muted-foreground">
+                                    Actor {event.actorType || 'unknown'} · {event.actorId || 'unknown'}
+                                  </div>
+                                )}
+                                {event.metadata && (
+                                  <pre className="overflow-x-auto rounded-md bg-background p-3 text-xs">
+                                    {JSON.stringify(event.metadata, null, 2)}
+                                  </pre>
+                                )}
                               </div>
-                              {(event.actorId || event.actorType) && (
-                                <div className="text-sm text-muted-foreground">
-                                  Actor {event.actorType || 'unknown'} · {event.actorId || 'unknown'}
-                                </div>
-                              )}
-                              {event.metadata && (
-                                <pre className="overflow-x-auto rounded-md bg-background p-3 text-xs">
-                                  {JSON.stringify(event.metadata, null, 2)}
-                                </pre>
-                              )}
+                            ))}
+                        </div>
+                      )}
+                    </div>
+
+                    <div className="rounded-lg border p-4 space-y-4">
+                      <div className="font-medium">子任务</div>
+                      {taskDetail.children.length === 0 ? (
+                        <div className="text-sm text-muted-foreground">暂无子任务</div>
+                      ) : (
+                        <div className="space-y-3">
+                          {taskDetail.children.map((child) => (
+                            <div key={child.id} className="rounded-md bg-muted/40 p-3">
+                              <div className="flex items-center gap-2 flex-wrap">
+                                <TaskStatusTag status={child.status} />
+                                <div className="font-medium break-all">{child.title}</div>
+                                {child.kind && (
+                                  <span className="text-sm text-muted-foreground">{child.kind}</span>
+                                )}
+                              </div>
+                              <div className="mt-2 grid grid-cols-1 xl:grid-cols-3 gap-3 text-sm">
+                                <InfoRow label="Task ID" value={child.id} />
+                                <InfoRow label="Queue" value={child.queueName || '未入队'} />
+                                <InfoRow label="更新时间" value={formatTimestamp(child.updatedAt)} />
+                              </div>
                             </div>
                           ))}
-                      </div>
-                    )}
-                  </div>
+                        </div>
+                      )}
+                    </div>
+                  </TabsContent>
 
-                  <div className="rounded-lg border p-4 space-y-4">
-                    <div className="font-medium">子任务</div>
-                    {taskDetail.children.length === 0 ? (
-                      <div className="text-sm text-muted-foreground">暂无子任务</div>
-                    ) : (
-                      <div className="space-y-3">
-                        {taskDetail.children.map((child) => (
-                          <div key={child.id} className="rounded-md bg-muted/40 p-3">
-                            <div className="flex items-center gap-2 flex-wrap">
-                              <TaskStatusTag status={child.status} />
-                              <div className="font-medium break-all">{child.title}</div>
-                              {child.kind && (
-                                <span className="text-sm text-muted-foreground">{child.kind}</span>
-                              )}
-                            </div>
-                            <div className="mt-2 grid grid-cols-1 xl:grid-cols-3 gap-3 text-sm">
-                              <InfoRow label="Task ID" value={child.id} />
-                              <InfoRow label="Queue" value={child.queueName || '未入队'} />
-                              <InfoRow label="更新时间" value={formatTimestamp(child.updatedAt)} />
-                            </div>
-                          </div>
-                        ))}
-                      </div>
-                    )}
-                  </div>
-                </>
+                  <TabsContent value="dag">
+                    <TaskDagPanel dag={taskDag} error={taskDagError} />
+                  </TabsContent>
+
+                  <TabsContent value="evidence">
+                    <TaskEvidencePanel taskId={taskDetail.task.id} items={taskEvidenceLinks} error={taskEvidenceError} />
+                  </TabsContent>
+                </Tabs>
               ) : (
                 <div className="text-sm text-muted-foreground">请选择任务查看详情</div>
               )}
@@ -1120,6 +1184,242 @@ function SummaryCard({
       </CardContent>
     </Card>
   )
+}
+
+function TaskDagPanel({
+  dag,
+  error,
+}: {
+  dag: TaskDagView | null
+  error: string | null
+}) {
+  if (error) {
+    return (
+      <div className="rounded-md bg-red-500/10 px-3 py-2 text-sm text-red-500">
+        {error}
+      </div>
+    )
+  }
+
+  if (!dag) {
+    return (
+      <div className="text-sm text-muted-foreground">
+        暂无依赖 DAG 数据
+      </div>
+    )
+  }
+
+  const columns = Array.from(
+    dag.nodes.reduce((accumulator, node) => {
+      const items = accumulator.get(node.dependencyDepth) || []
+      items.push(node)
+      accumulator.set(node.dependencyDepth, items)
+      return accumulator
+    }, new Map<number, TaskDagView['nodes']>())
+  ).sort((a, b) => a[0] - b[0])
+
+  const blockedCount = dag.nodes.filter((node) => node.blockedByTaskIds.length > 0).length
+  const claimableCount = dag.nodes.filter((node) => node.isClaimable).length
+  const failedDependencyCount = dag.nodes.filter((node) => node.failedDependencyTaskIds.length > 0).length
+
+  return (
+    <div className="space-y-6">
+      <div className="grid gap-3 xl:grid-cols-4">
+        <InfoRow label="节点数" value={String(dag.nodes.length)} />
+        <InfoRow label="可认领节点" value={String(claimableCount)} />
+        <InfoRow label="阻塞节点" value={String(blockedCount)} />
+        <InfoRow label="失败依赖" value={String(failedDependencyCount)} />
+      </div>
+
+      <div className="rounded-lg border p-4 space-y-4">
+        <div className="font-medium">依赖解锁视图</div>
+        <div className="grid gap-3 xl:grid-cols-2">
+          <InfoRow label="本次完成依赖" value={joinValues(dag.unlock.completedDependencyTaskIds)} />
+          <InfoRow label="新可认领" value={joinValues(dag.unlock.newlyClaimableTaskIds)} />
+          <InfoRow label="仍被阻塞" value={joinValues(dag.unlock.stillBlockedTaskIds)} />
+          <InfoRow label="失败传播候选" value={joinValues(dag.unlock.failedPropagationCandidates)} />
+        </div>
+      </div>
+
+      <div className="space-y-4">
+        {columns.map(([depth, nodes]) => (
+          <div key={depth} className="rounded-lg border p-4 space-y-4">
+            <div className="flex items-center justify-between gap-4">
+              <div className="font-medium">依赖层级 {depth}</div>
+              <div className="text-sm text-muted-foreground">{nodes.length} 个节点</div>
+            </div>
+            <div className="grid gap-3 xl:grid-cols-2">
+              {nodes.map((node) => (
+                <div key={node.taskId} className={`rounded-md border p-3 space-y-3 ${node.taskId === dag.focusTaskId ? 'border-primary bg-primary/5' : 'bg-muted/30'}`}>
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <TaskStatusTag status={node.status} />
+                    {node.taskId === dag.focusTaskId && (
+                      <span className="rounded-full bg-primary/10 px-2 py-1 text-xs font-medium text-primary">
+                        focus
+                      </span>
+                    )}
+                    <div className="font-medium break-all">{node.title}</div>
+                  </div>
+                  <div className="grid gap-3 xl:grid-cols-2 text-sm">
+                    <InfoRow label="Task ID" value={node.taskId} />
+                    <InfoRow label="Queue" value={node.queueName || '未入队'} />
+                    <InfoRow label="依赖" value={joinValues(node.dependsOnTaskIds)} />
+                    <InfoRow label="解锁下游" value={joinValues(node.dependentTaskIds)} />
+                  </div>
+                  <div className="flex flex-wrap gap-2 text-xs">
+                    <DagChip label="blocked by" value={joinValues(node.blockedByTaskIds)} />
+                    <DagChip label="failed deps" value={joinValues(node.failedDependencyTaskIds)} />
+                    <DagChip label="claimable" value={node.isClaimable ? 'yes' : 'no'} />
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+function TaskEvidencePanel({
+  taskId,
+  items,
+  error,
+}: {
+  taskId: string
+  items: TaskEvidenceLinkData[]
+  error: string | null
+}) {
+  if (error) {
+    return (
+      <div className="rounded-md bg-red-500/10 px-3 py-2 text-sm text-red-500">
+        {error}
+      </div>
+    )
+  }
+
+  const mirroredCount = items.filter((item) => Boolean(item.memory)).length
+  const ragIndexedCount = items.filter((item) => Boolean(readNestedValue(item.evidence.metadata, 'rag', 'collectionId'))).length
+
+  return (
+    <div className="space-y-6">
+      <div className="flex flex-wrap gap-2">
+        <Button asChild variant="outline" size="sm">
+          <Link href={`/evidence?taskId=${encodeURIComponent(taskId)}&space=${encodeURIComponent(`task:${taskId}`)}`}>
+            打开证据中心
+          </Link>
+        </Button>
+      </div>
+
+      <div className="grid gap-3 xl:grid-cols-3">
+        <InfoRow label="证据条数" value={String(items.length)} />
+        <InfoRow label="已镜像记忆" value={String(mirroredCount)} />
+        <InfoRow label="已入库 RAG" value={String(ragIndexedCount)} />
+      </div>
+
+      {items.length === 0 ? (
+        <div className="text-sm text-muted-foreground">暂无任务证据</div>
+      ) : (
+        <div className="space-y-4">
+          {items.map((item) => {
+            const ragCollectionId = readNestedValue(item.evidence.metadata, 'rag', 'collectionId')
+            const ragDocumentId = readNestedValue(item.evidence.metadata, 'rag', 'documentId')
+            const memorySpace = item.memory?.space || readNestedValue(item.evidence.metadata, 'memory', 'space')
+
+            return (
+              <div key={item.evidence.id} className="rounded-lg border p-4 space-y-4">
+                <div className="flex flex-col gap-3 xl:flex-row xl:items-start xl:justify-between">
+                  <div className="space-y-2">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span className="rounded-full bg-primary/10 px-2 py-1 text-xs font-medium text-primary">
+                        {item.evidence.kind}
+                      </span>
+                      {item.memory && (
+                        <span className="rounded-full bg-emerald-500/10 px-2 py-1 text-xs font-medium text-emerald-600">
+                          mirrored memory
+                        </span>
+                      )}
+                      {ragCollectionId && (
+                        <span className="rounded-full bg-blue-500/10 px-2 py-1 text-xs font-medium text-blue-600">
+                          rag indexed
+                        </span>
+                      )}
+                    </div>
+                    <div className="font-medium break-all">
+                      {item.evidence.title || item.task.title || item.evidence.id}
+                    </div>
+                  </div>
+                  <div className="text-xs text-muted-foreground">
+                    {formatTimestamp(item.evidence.createdAt)}
+                  </div>
+                </div>
+
+                {item.evidence.content && (
+                  <div className="rounded-md bg-muted/40 p-3 text-sm whitespace-pre-wrap break-words">
+                    {item.evidence.content}
+                  </div>
+                )}
+
+                <div className="grid gap-3 xl:grid-cols-3 text-sm">
+                  <InfoRow label="Evidence ID" value={item.evidence.id} />
+                  <InfoRow label="Source" value={item.evidence.source || '无'} />
+                  <InfoRow label="URI" value={item.evidence.uri || '无'} />
+                </div>
+
+                {(item.memory || ragCollectionId || ragDocumentId || memorySpace) && (
+                  <div className="grid gap-3 xl:grid-cols-2 text-sm">
+                    <InfoRow label="Memory ID" value={item.memory?.id || readNestedValue(item.evidence.metadata, 'memory', 'id') || '无'} />
+                    <InfoRow label="Memory Space" value={memorySpace || '无'} />
+                    <InfoRow label="RAG Collection" value={ragCollectionId || '无'} />
+                    <InfoRow label="RAG Document" value={ragDocumentId || '无'} />
+                  </div>
+                )}
+
+                {item.memory && (
+                  <div className="rounded-md bg-emerald-500/5 p-3 space-y-2">
+                    <div className="font-medium">共享记忆镜像</div>
+                    <div className="grid gap-3 xl:grid-cols-3 text-sm">
+                      <InfoRow label="Kind" value={item.memory.kind} />
+                      <InfoRow label="Space" value={item.memory.space} />
+                      <InfoRow label="Version" value={String(item.memory.version)} />
+                    </div>
+                    {(item.memory.summary || item.memory.content) && (
+                      <div className="text-sm text-muted-foreground whitespace-pre-wrap break-words">
+                        {item.memory.summary || item.memory.content}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            )
+          })}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function DagChip({ label, value }: { label: string; value: string }) {
+  return (
+    <span className="rounded-full bg-background px-2 py-1">
+      {label}: {value}
+    </span>
+  )
+}
+
+function joinValues(values: string[]) {
+  return values.length > 0 ? values.join('、') : '无'
+}
+
+function readNestedValue(
+  value: Record<string, unknown> | undefined,
+  firstKey: string,
+  secondKey: string
+) {
+  const nested = value?.[firstKey]
+  if (!nested || typeof nested !== 'object' || Array.isArray(nested)) return undefined
+  const next = (nested as Record<string, unknown>)[secondKey]
+  return typeof next === 'string' && next.trim() ? next : undefined
 }
 
 function MetricBox({

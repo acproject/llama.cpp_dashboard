@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
+import { listTaskEvidenceWithLinks } from '@/lib/evidence'
 import { addTaskEvidence, getTask, listTaskEvidence } from '@/lib/tasks'
 
 export async function GET(
@@ -7,6 +8,14 @@ export async function GET(
 ) {
   try {
     const { id } = await params
+    const { searchParams } = new URL(_request.url)
+    const include = new Set(
+      searchParams
+        .getAll('include')
+        .flatMap((value) => value.split(','))
+        .map((value) => value.trim())
+        .filter(Boolean)
+    )
     const task = await getTask(id)
 
     if (!task) {
@@ -18,7 +27,9 @@ export async function GET(
 
     return NextResponse.json({
       success: true,
-      data: await listTaskEvidence(id),
+      data: include.has('memory')
+        ? await listTaskEvidenceWithLinks(id)
+        : await listTaskEvidence(id),
     })
   } catch (error) {
     return NextResponse.json(

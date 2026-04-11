@@ -442,6 +442,115 @@ export interface TaskClaimResult {
   lease: TaskLease
 }
 
+export interface TaskDependencyNode {
+  taskId: string
+  title: string
+  kind?: string
+  status: TaskStatus
+  priority: TaskPriority
+  queueName?: string
+  parentTaskId?: string
+  rootTaskId?: string
+  dependsOnTaskIds: string[]
+  dependentTaskIds: string[]
+  blockedByTaskIds: string[]
+  failedDependencyTaskIds: string[]
+  dependencyDepth: number
+  isClaimable: boolean
+  createdAt: number
+  updatedAt: number
+}
+
+export interface TaskDependencyEdge {
+  fromTaskId: string
+  toTaskId: string
+  relation: 'depends_on' | 'parent_child'
+}
+
+export interface TaskDependencyUnlockData {
+  taskId: string
+  completedDependencyTaskIds: string[]
+  newlyClaimableTaskIds: string[]
+  stillBlockedTaskIds: string[]
+  failedPropagationCandidates: string[]
+}
+
+export interface TaskDagView {
+  rootTaskId: string
+  focusTaskId: string
+  nodes: TaskDependencyNode[]
+  edges: TaskDependencyEdge[]
+  unlock: TaskDependencyUnlockData
+}
+
+export type MemoryKind =
+  | 'run_summary'
+  | 'fact'
+  | 'artifact'
+  | 'evidence'
+  | 'review_comment'
+  | 'note'
+
+export type MemoryScopeType = 'global' | 'agent' | 'task' | 'run' | 'session'
+
+export interface MemoryRecord {
+  id: string
+  space: string
+  kind: MemoryKind
+  scopeType: MemoryScopeType
+  scopeId?: string
+  title?: string
+  summary?: string
+  content?: string
+  tags: string[]
+  source?: string
+  uri?: string
+  agentId?: string
+  taskId?: string
+  runId?: string
+  sessionId?: string
+  version: number
+  metadata?: Record<string, unknown>
+  createdAt: number
+  updatedAt: number
+}
+
+export type EvidenceSourceType = 'task_evidence' | 'memory' | 'rag_hit'
+
+export type EvidenceScopeType = 'collection' | 'task' | 'run' | 'session' | 'agent' | 'memory_space'
+
+export interface EvidenceScope {
+  type: EvidenceScopeType
+  id: string
+}
+
+export interface EvidenceRecord {
+  id: string
+  sourceType: EvidenceSourceType
+  title?: string
+  summary?: string
+  content?: string
+  source?: string
+  uri?: string
+  tags: string[]
+  score: number | null
+  scopes: EvidenceScope[]
+  collectionId?: string
+  documentId?: string
+  chunkId?: string
+  memoryId?: string
+  taskEvidenceId?: string
+  space?: string
+  taskId?: string
+  runId?: string
+  sessionId?: string
+  agentId?: string
+  kind?: string
+  createdAt?: number
+  updatedAt?: number
+  metadata?: Record<string, unknown>
+}
+
 export interface RuntimeSummary {
   recentRuns: number
   activeRequests: number

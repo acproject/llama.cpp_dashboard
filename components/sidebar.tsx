@@ -12,6 +12,7 @@ import {
   Bot,
   Route,
   Database,
+  LibraryBig,
   MessagesSquare
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
@@ -24,6 +25,7 @@ const navigation = [
   { name: '运行态', href: '/runs', icon: Route },
   { name: 'Agent注册', href: '/agents', icon: Bot },
   { name: 'RAG管理', href: '/rag', icon: Database },
+  { name: '证据中心', href: '/evidence', icon: LibraryBig },
   { name: '服务调试', href: '/debug', icon: Bug },
   { name: '调度配置', href: '/config', icon: Settings },
   { name: 'Nginx配置', href: '/nginx', icon: Globe },

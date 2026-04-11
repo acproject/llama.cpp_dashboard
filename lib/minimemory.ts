@@ -52,6 +52,7 @@ export const KEYS = {
   TASK_EVIDENCE: (taskId: string, evidenceId: string) => `task:evidence:${taskId}:${evidenceId}`,
   TASK_EVIDENCES: (taskId: string) => `task:evidences:${taskId}`,
   TASK_QUEUE: (queueName: string) => `task:queue:${queueName}`,
+  MEMORY: (id: string) => `memory:item:${id}`,
   RAG_COLLECTION: (id: string) => `rag:collection:${id}`,
   RAG_DOCUMENT: (collectionId: string, documentId: string) => `rag:document:${collectionId}:${documentId}`,
   RAG_CHUNK: (collectionId: string, documentId: string, chunkIndex: number) =>
